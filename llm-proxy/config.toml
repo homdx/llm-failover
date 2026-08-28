@@ -1,0 +1,39 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[upstream]
+host = "openai.example.ai"
+timeout_sec = 120   # per-attempt urlopen timeout to NVIDIA
+
+[proxy]
+# Leave false if you're launching this with `proxychains4 python3 main.py`.
+# Set true (and fill in the two fields below) only if you want the script
+# itself to tunnel through SOCKS5 instead of relying on proxychains.
+use_socks5 = false
+socks5_host = "127.0.0.1"
+socks5_port = 1080
+
+[logging]
+enabled = true
+log_dir = "logs"
+# Cap on how many bytes of each response body get written to the log file.
+body_limit_bytes = 200000
+
+[retry]
+# On these upstream status codes, hold the connection to Kilo open, wait,
+# and silently re-send the same request — Kilo only ever sees the final
+# outcome, never the failed attempt(s).
+enabled = true
+status_codes = [400, 425]
+max_attempts = 3       # total tries, including the first — so 2 retries here
+# pause_seconds is only the FALLBACK wait: if the upstream response has a
+# Retry-After header, or a "try again in Xms" / "retry in Xs" hint in the
+# error body, that number is used instead — pause_seconds only applies
+# when neither is present.
+pause_seconds = 15
+# A resolved wait longer than this (header or body hint) is treated as a
+# quota reset rather than a transient limit — the error is forwarded to
+# Kilo immediately instead of holding its connection open that long.
+max_pause_seconds = 180
+
