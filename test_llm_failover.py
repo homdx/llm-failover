@@ -410,6 +410,172 @@ class TestRateRotInPool(RotBase):
             PooledClient(pool, max_failover=1).chat_json("s", "u")
 
 
+class TestMaskApiKey(unittest.TestCase):
+    """MASK-KEY-1 (ported from jan-auto-agent, tools/llm_stream.py, branch
+    improvements45): a real or placeholder ``api_key = ...`` line inside a
+    prompt must not reach the LLM verbatim."""
+
+    def setUp(self):
+        _ServerCaps.reset()
+
+    def tearDown(self):
+        _ServerCaps.reset()
+
+    def test_masks_plain_assignment(self):
+        text = "before\napi_key = sk-real-secret-123\nafter"
+        self.assertEqual(
+            llm_client.mask_api_key(text),
+            "before\napi_key = here_your_key\nafter")
+
+    def test_masks_comment_prefixed_assignment(self):
+        text = "; api_key = sk-real-secret-123"
+        self.assertEqual(llm_client.mask_api_key(text),
+                         "; api_key = here_your_key")
+
+    def test_leaves_text_without_api_key_line_unchanged(self):
+        text = "just a normal prompt that mentions api_key handling"
+        self.assertEqual(llm_client.mask_api_key(text), text)
+
+    def test_handles_empty_and_none(self):
+        self.assertEqual(llm_client.mask_api_key(""), "")
+        self.assertIsNone(llm_client.mask_api_key(None))
+
+    def test_build_request_masks_system_and_user_content(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai")
+        _, _, payload = c._build_request(
+            "system prompt\napi_key = leak-me-1",
+            "user prompt\napi_key = leak-me-2",
+            0.4, 400)
+        sys_msg, user_msg = payload["messages"]
+        self.assertNotIn("leak-me-1", sys_msg["content"])
+        self.assertNotIn("leak-me-2", user_msg["content"])
+        self.assertIn("here_your_key", sys_msg["content"])
+        self.assertIn("here_your_key", user_msg["content"])
+
+
+class TestZaiThinking(unittest.TestCase):
+    """AUTO-ZAITHINK-1 / GLM-5 (ported from jan-auto-agent, tools/
+    llm_stream.py, branch improvements45): Z.ai/GLM's own top-level
+    ``thinking`` field, sent additively alongside the existing
+    chat_template_kwargs/reasoning_effort/reasoning fields."""
+
+    def setUp(self):
+        _ServerCaps.reset()
+
+    def tearDown(self):
+        _ServerCaps.reset()
+
+    def test_thinking_field_disabled_when_think_false(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", think=False)
+        _, _, payload = c._build_request("s", "u", 0.4, 400)
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+
+    def test_thinking_field_enabled_when_think_true(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", think=True)
+        _, _, payload = c._build_request("s", "u", 0.4, 400)
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+
+    def test_thinking_field_absent_when_think_unset(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai")
+        _, _, payload = c._build_request("s", "u", 0.4, 400)
+        self.assertNotIn("thinking", payload)
+
+    def test_thinking_field_absent_for_ollama(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="ollama", think=False)
+        _, _, payload = c._build_request("s", "u", 0.4, 400)
+        self.assertNotIn("thinking", payload)
+
+    def test_400_naming_thinking_disables_just_that_field_and_retries(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", think=False, error_retries=0)
+        seen = []
+
+        def fake_open(req, **kw):
+            body = json.loads(req.data)
+            seen.append(body)
+            if "thinking" in body:
+                raise http_error(
+                    400,
+                    b'{"error":"Unknown name \\"thinking\\": '
+                    b'Cannot find field."}')
+            return FakeResp({"choices": [{"message": {"content": "ok"},
+                                          "finish_reason": "stop"}]})
+
+        llm_client.urllib.request.urlopen = fake_open
+        try:
+            result = c.chat("s", "u")
+        finally:
+            llm_client.urllib.request.urlopen = _REAL_URLOPEN
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(seen), 2)
+        self.assertIn("thinking", seen[0])
+        self.assertNotIn("thinking", seen[1])
+        # unrelated fields must survive — only "thinking" was disabled
+        self.assertIn("reasoning_effort", seen[1])
+        self.assertIn("reasoning", seen[1])
+        self.assertTrue(
+            _ServerCaps.think_field_rejected("http://x", "thinking"))
+
+
+class TestOllamaNullContent(unittest.TestCase):
+    """BUGFIX (ported from jan-auto-agent, tools/llm_stream.py, branch
+    improvements45): some Ollama-compatible backends return
+    "content": null (JSON null) instead of omitting the key or using "" —
+    this must degrade to an empty reply, not crash."""
+
+    def setUp(self):
+        _ServerCaps.reset()
+
+    def tearDown(self):
+        _ServerCaps.reset()
+
+    def test_null_content_does_not_raise(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="ollama")
+
+        def fake_open(req, **kw):
+            return FakeResp({"message": {"role": "assistant", "content": None},
+                             "done": True, "eval_count": 0})
+
+        llm_client.urllib.request.urlopen = fake_open
+        try:
+            result = c.chat("s", "u")
+        finally:
+            llm_client.urllib.request.urlopen = _REAL_URLOPEN
+        self.assertEqual(result, "")
+
+
+class TestStripJsonFenceFix(unittest.TestCase):
+    """BUGFIX (ported from jan-auto-agent, tools/llm_stream.py, branch
+    improvements45): a stray/unpaired ``` must not be treated as a fence
+    and silently discard real content that precedes it."""
+
+    def test_well_formed_json_fence_still_stripped(self):
+        text = '```json\n{"a": 1}\n```'
+        self.assertEqual(llm_client.strip_json_fence(text), '{"a": 1}')
+
+    def test_well_formed_plain_fence_still_stripped(self):
+        text = '```\n{"a": 1}\n```'
+        self.assertEqual(llm_client.strip_json_fence(text), '{"a": 1}')
+
+    def test_stray_unpaired_fence_does_not_discard_preceding_content(self):
+        text = 'The answer is: {"code": "```"}'
+        self.assertEqual(llm_client.strip_json_fence(text), text)
+
+    def test_truncated_opening_fence_returned_unchanged(self):
+        text = "Sure, here's the JSON:\n```json"
+        self.assertEqual(llm_client.strip_json_fence(text), text)
+
+    def test_no_fence_returned_unchanged(self):
+        text = '{"a": 1}'
+        self.assertEqual(llm_client.strip_json_fence(text), text)
+
+
 class FakeResp:
     def __init__(self, payload):
         self._b = json.dumps(payload).encode()

@@ -44,6 +44,10 @@ server failover — is built on top of those two.
   a row raise a dedicated exception instead, on the theory that a caller silently falling
   back to a stub answer six times in a row is worse than stopping and saying so.
 
+- **Secrets in a prompt don't reach the LLM.** If a system/user message happens to
+  contain an `api_key = ...` line (a config file's contents pulled into context, for
+  example), the client masks the value before sending, regardless of which key it is.
+
 ## Minimal usage
 
 ```python

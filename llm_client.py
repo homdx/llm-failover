@@ -5,7 +5,10 @@ Minimal chat-completion client that speaks both Ollama (``/api/chat``) and
 any OpenAI-compatible server (``/v1/chat/completions``). Payload shapes are
 a simplified version of tools/llm_stream.py from
 https://github.com/homdx/jan-auto-agent (branch collect-fix-2), so configs
-and call style match that project.
+and call style match that project. A handful of fixes made upstream since
+then (branch improvements45) — MASK-KEY-1 secret masking, AUTO-ZAITHINK-1
+Z.ai/GLM thinking-control field, and two response-parsing bugfixes — were
+ported back here; each is marked with its upstream tag below.
 
 Usage:
 
@@ -56,12 +59,57 @@ def strip_think(text: str) -> str:
 
 
 def strip_json_fence(text: str) -> str:
-    """Remove a ```json ... ``` / ``` ... ``` fence if present."""
+    """Remove a ```json ... ``` / ``` ... ``` fence if present.
+
+    BUGFIX (ported from jan-auto-agent, tools/llm_stream.py, branch
+    improvements45): a lone/unpaired ``` — output truncated mid-stream, or
+    a stray ``` occurring inside otherwise-unfenced content — used to fall
+    through to split("```")[0], which silently discarded everything before
+    that first ``` even though it was never a real fence pair. A closing
+    ``` must now actually be found before anything is treated as a fenced
+    block; otherwise the text is returned unchanged.
+    """
     if "```json" in text:
-        return text.split("```json")[1].split("```")[0].strip()
+        rest = text.split("```json", 1)[1]
+        if "```" in rest:
+            return rest.split("```")[0].strip()
+        return text
     if "```" in text:
-        return text.split("```")[1].split("```")[0].strip()
+        before, _, rest = text.partition("```")
+        if "```" in rest:
+            return rest.split("```")[0].strip()
+        return text
     return text
+
+
+# MASK-KEY-1 (ported from jan-auto-agent, tools/llm_stream.py, branch
+# improvements45): matches an ini-style `api_key = <value>` assignment
+# line, including comment-prefixed variants such as `### api_key = ...`
+# or `; api_key = ...` (any leading whitespace, optional comment chars
+# [#;]+ before the key name; case-insensitive key name), so a real or
+# test secret pasted/read into a prompt (a config file's contents, a
+# support dump, ...) never reaches the LLM verbatim. Captures the prefix
+# (indent + optional comment + "api_key = ") separately so only the
+# value is swapped for the placeholder.
+_API_KEY_LINE_RE = re.compile(
+    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$'
+)
+
+
+def mask_api_key(text: str) -> str:
+    """Replace every ``api_key = <value>`` line in *text* with
+    ``api_key = here_your_key``, regardless of what the value actually is
+    (a placeholder like "test", a real key, anything non-blank).
+
+    Plain string transform with no knowledge of which key is "real" — it
+    masks unconditionally so a secret embedded in file content pulled
+    into a prompt (this client's own system/user message text) can't leak
+    to the LLM. Non-string input (``None``, text with no such line) is
+    returned unchanged.
+    """
+    if not text:
+        return text
+    return _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
 
 
 def _make_unverified_context() -> ssl.SSLContext:
@@ -96,6 +144,12 @@ _MUST_BE_ONE_OF_RE = re.compile(r"must be one of\s*((?:`[^`]+`[,\s]*(?:or\s*)?)+
                                 re.IGNORECASE)
 _BACKTICK_VALUE_RE = re.compile(r"`([^`]+)`")
 _RETRY_AFTER_S_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
+# AUTO-ZAITHINK-1: matches "thinking" as a rejected field name in an HTTP
+# 400 body (ported from jan-auto-agent, tools/llm_stream.py, branch
+# improvements45). Word-boundary only — the payload's "thinking" object is
+# a distinct field from "reasoning"/"reasoning_effort" above, so this
+# never collides with _BARE_REASONING_FIELD_RE.
+_BARE_THINKING_FIELD_RE = re.compile(r"\bthinking\b", re.IGNORECASE)
 
 
 def _parse_retry_after(e: urllib.error.HTTPError, detail: str):
@@ -475,9 +529,14 @@ class LLMClient:
             # will not defeat stronger protection, but 1010 is usually the UA.
             "User-Agent": "learn-in-play1-llm-client/1.0 (+https://github.com/homdx/learn-in-play1)",
         }
+        # MASK-KEY-1: mask any `api_key = ...` line that ended up inside
+        # the system/user text itself (e.g. a config file's contents
+        # pulled into context) — NOT self.api_key, which is this
+        # request's own credential and is used as-is in the
+        # Authorization header above.
         messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "system", "content": mask_api_key(system)},
+            {"role": "user", "content": mask_api_key(user)},
         ]
         if self.api_format == "ollama":
             url = _ollama_chat_url(self.base_url)
@@ -530,6 +589,23 @@ class LLMClient:
                     payload["reasoning_effort"] = _ServerCaps.reasoning_effort_for(self.base_url)
                 if not _ServerCaps.think_field_rejected(self.base_url, "reasoning"):
                     payload["reasoning"] = {"effort": "low", "exclude": True}
+            # AUTO-ZAITHINK-1 (ported from jan-auto-agent, tools/llm_stream.py,
+            # branch improvements45): Z.ai/GLM's own thinking-control
+            # convention — a top-level `thinking: {"type": "enabled"|
+            # "disabled"}` object, distinct from chat_template_kwargs/
+            # reasoning_effort/reasoning above (neither is Z.ai's documented
+            # shape). Sent ADDITIONALLY, never instead of them, for either
+            # value of self.think (not just False): a provider that doesn't
+            # recognise `thinking` is expected to silently ignore the
+            # unknown field, the same assumption the other three fields
+            # already rely on, so trying all four costs nothing against a
+            # provider that only speaks one. Upstream report: a GLM-5.2
+            # endpoint ignored all three existing fields, defaulted to its
+            # own "Max" reasoning effort, and burned the whole max_tokens
+            # budget on <think> before any content was written.
+            if self.think is not None and not _ServerCaps.think_field_rejected(
+                    self.base_url, "thinking"):
+                payload["thinking"] = {"type": "enabled" if self.think else "disabled"}
         _dbg(f"_build_request: url={url!r}, model={self.model!r}, "
              f"api_format={self.api_format!r}, think={self.think!r}, "
              f"num_ctx={self.num_ctx}, max_tokens={max_tokens}, temp={temperature}, "
@@ -543,7 +619,16 @@ class LLMClient:
         if self.api_format == "ollama":
             msg = raw.get("message", {})
             _dbg(f"  ollama message keys: {list(msg.keys())}")
-            content = msg.get("content", "")
+            # BUGFIX (ported from jan-auto-agent, tools/llm_stream.py,
+            # branch improvements45): some Ollama-compatible backends
+            # return "content": null (JSON null) rather than omitting the
+            # key or using "" — a `.get("content", "")` default only
+            # covers a MISSING key, not an explicit null value, so this
+            # returned None here and `.strip()` below raised
+            # AttributeError on a reply that otherwise arrived
+            # successfully, instead of degrading to an empty string the
+            # same way a filtered/empty openai `choices` list already does.
+            content = msg.get("content") or ""
             # Some thinking models in Ollama put the reasoning in
             # message.thinking and leave content empty.
             thinking = msg.get("thinking", "")
@@ -777,6 +862,16 @@ class LLMClient:
                         and not _ServerCaps.think_field_rejected(
                             self.base_url, "reasoning")):
                     newly_rejected.append("reasoning")
+                # AUTO-ZAITHINK-1: same one-field-at-a-time treatment as
+                # reasoning/chat_template_kwargs above — a provider (e.g. a
+                # strict-schema gateway) that rejects the `thinking` object
+                # outright gets just that field disabled and remembered;
+                # reasoning_effort/reasoning keep working if the server
+                # accepted those.
+                if (_BARE_THINKING_FIELD_RE.search(detail)
+                        and not _ServerCaps.think_field_rejected(
+                            self.base_url, "thinking")):
+                    newly_rejected.append("thinking")
 
                 if newly_rejected or reasoning_effort_fixed:
                     for f in newly_rejected:
