@@ -576,6 +576,104 @@ class TestStripJsonFenceFix(unittest.TestCase):
         self.assertEqual(llm_client.strip_json_fence(text), text)
 
 
+class TestNetworkExceptionRetry(unittest.TestCase):
+    """AUTO-FIX (ported from jan-auto-agent, tools/llm_stream.py, branch
+    improvements45, medium-priority audit): a raw TimeoutError/
+    ssl.SSLError/ConnectionError from a response-read used to leak
+    straight out of chat() with no retry at all, bypassing
+    error_retries/HTTP-RETRY entirely."""
+
+    def setUp(self):
+        _ServerCaps.reset()
+        LLMClient.reset_breaker()
+        self.slept = []
+        self._real_sleep = llm_client.time.sleep
+        llm_client.time.sleep = self.slept.append
+
+    def tearDown(self):
+        llm_client.time.sleep = self._real_sleep
+        _ServerCaps.reset()
+        LLMClient.reset_breaker()
+
+    def test_timeout_is_retried_and_can_succeed(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", error_retries=2,
+                      error_retry_wait_sec=5)
+        calls = []
+
+        def fake_open(req, **kw):
+            calls.append(1)
+            if len(calls) < 2:
+                raise TimeoutError("timed out")
+            return FakeResp({"choices": [{"message": {"content": "ok"},
+                                          "finish_reason": "stop"}]})
+
+        llm_client.urllib.request.urlopen = fake_open
+        try:
+            result = c.chat("s", "u")
+        finally:
+            llm_client.urllib.request.urlopen = _REAL_URLOPEN
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.slept, [5])
+
+    def test_timeout_exhausted_reraises_unwrapped_for_breaker_exemption(self):
+        """A TimeoutError must reach the caller AS a TimeoutError so
+        _is_timeout()/_note_failure() keep exempting it from bumping the
+        breaker — wrapping it in a RuntimeError would silently defeat
+        that check."""
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", error_retries=0)
+
+        def fake_open(req, **kw):
+            raise TimeoutError("timed out")
+
+        llm_client.urllib.request.urlopen = fake_open
+        try:
+            with self.assertRaises(TimeoutError):
+                c.chat("s", "u")
+        finally:
+            llm_client.urllib.request.urlopen = _REAL_URLOPEN
+
+    def test_connection_error_exhausted_wraps_in_friendly_runtime_error(self):
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", error_retries=1,
+                      error_retry_wait_sec=1)
+
+        def fake_open(req, **kw):
+            raise ConnectionResetError("reset by peer")
+
+        llm_client.urllib.request.urlopen = fake_open
+        try:
+            with self.assertRaises(RuntimeError):
+                c.chat("s", "u")
+        finally:
+            llm_client.urllib.request.urlopen = _REAL_URLOPEN
+        self.assertEqual(self.slept, [1])
+
+    def test_ssl_error_is_retried(self):
+        import ssl
+        c = LLMClient(base_url="http://x", api_key="k", model="m",
+                      api_format="openai", error_retries=1,
+                      error_retry_wait_sec=2)
+        calls = []
+
+        def fake_open(req, **kw):
+            calls.append(1)
+            if len(calls) < 2:
+                raise ssl.SSLError("bad handshake")
+            return FakeResp({"choices": [{"message": {"content": "ok"},
+                                          "finish_reason": "stop"}]})
+
+        llm_client.urllib.request.urlopen = fake_open
+        try:
+            result = c.chat("s", "u")
+        finally:
+            llm_client.urllib.request.urlopen = _REAL_URLOPEN
+        self.assertEqual(result, "ok")
+        self.assertEqual(self.slept, [2])
+
+
 class FakeResp:
     def __init__(self, payload):
         self._b = json.dumps(payload).encode()

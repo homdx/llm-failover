@@ -933,6 +933,48 @@ class LLMClient:
                 f"Проверьте, что сервер запущен (ollama serve / Jan API server) "
                 f"и base_url в config.ini указан верно."
             ) from None
+        except (TimeoutError, ssl.SSLError, ConnectionError) as e:
+            # AUTO-FIX (ported from jan-auto-agent, tools/llm_stream.py,
+            # branch improvements45, medium-priority audit): these
+            # previously had no explicit handling here and propagated as a
+            # raw, context-free exception on the very first transient
+            # network hiccup, bypassing error_retries/HTTP-RETRY entirely
+            # — even though this project's own config.example.ini
+            # documents normal replies taking 5-15 minutes, exactly the
+            # kind of transient condition that budget exists for. A
+            # response-read timeout in particular reaches here rather than
+            # the urllib.error.URLError branch above, since urllib only
+            # wraps a connect-phase OSError, not a read-phase one. Reuses
+            # the SAME error_retries/error_retry_wait_sec budget as a
+            # retryable HTTP status, rather than a second, divergent retry
+            # mechanism.
+            if _http_retry_n < self.error_retries:
+                wait_s = self.error_retry_wait_sec
+                on_retry = getattr(self, "on_retry", None)
+                msg = (f"{type(e).__name__} при обращении к {url}: {e}, "
+                      f"жду {wait_s:.1f} сек и повторяю тот же запрос "
+                      f"(попытка {_http_retry_n + 1}/{self.error_retries})")
+                if on_retry:
+                    on_retry(msg)
+                _dbg(f"chat(): {msg}")
+                time.sleep(wait_s)
+                return self.chat(system, user, temperature=temperature,
+                                 max_tokens=max_tokens, json_mode=json_mode,
+                                 _retried_429=_retried_429,
+                                 _http_retry_n=_http_retry_n + 1)
+            # RETRY-1/_is_timeout: a TimeoutError must reach the caller AS
+            # a TimeoutError, unwrapped. _is_timeout()/_note_failure()
+            # deliberately exempt timeouts from bumping the breaker (a
+            # slow-but-alive ollama on a CPU laptop is normal, not a
+            # fault) — wrapping it in a RuntimeError here would silently
+            # defeat that check for any caller going through chat_json().
+            if _is_timeout(e):
+                raise
+            raise RuntimeError(
+                f"{type(e).__name__} при обращении к {url}: {e} "
+                f"(после {_http_retry_n} попыт"
+                f"{'ки' if _http_retry_n == 1 else 'ок'})"
+            ) from None
 
         text = self._extract_content(raw)
         _dbg(f"chat(): raw text len={len(text)}, repr(first 300): {text[:300]!r}")
