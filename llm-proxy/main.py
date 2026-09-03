@@ -1,108 +1,47 @@
 """
-Local HTTP proxy that forwards OpenAI-compatible requests from Kilo to a
-single upstream provider (OPENAI Example backend by default),
+Local HTTP proxy that forwards OpenAI-compatible requests from Kilo to
+NVIDIA's build.nvidia.com / NIM API (https://integrate.api.nvidia.com/v1),
 with full request/response logging in JSON Lines format so you can see
 exactly what Kilo is sending.
 
-Settings live in a config.toml next to this file — see --config below.
+Settings live in config.toml next to this file.
 
 Run directly:
     python3 main.py
 
-Run tunneled through an external SOCKS5 proxy (this is what fixes a 451
+Run tunneled through an external SOCKS5 proxy (this is what fixes the 451
 geo-block — leave proxy.use_socks5 = false in config.toml when doing this,
 the two mechanisms shouldn't both be active):
     proxychains4 python3 main.py
 
 Point Kilo's baseUrl at:
-    http://127.0.0.1:8080/v1
-
-Multiple providers: run one process PER provider, each with its own
-config file (own port, own upstream host, own log_dir):
-    python3 main.py --config config.other.toml
-    python3 main.py --config config.openrouter.toml
-See config.openrouter.toml for a second, fully worked example.
-
-With no --config given: if exactly one *.toml file sits in the current
-directory (any filename), it's used automatically. With more than one,
-you must pass --config explicitly — the script lists the candidates and
-the exact command for each so you don't have to remember file names.
+    http://<server.host>:<server.port>/v1   (see config.toml — currently 127.0.0.1:8081)
 """
 
-import argparse
 import http.server
 import json
 import os
 import re
-import sys
 import threading
 import time
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 try:
     import tomllib  # stdlib on Python 3.11+
 except ModuleNotFoundError:
     import tomli as tomllib  # pip install tomli   (Python < 3.11)
 
-
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description="OpenAI-compatible logging/retry proxy for one upstream provider."
-    )
-    p.add_argument(
-        "--config", default=None,
-        help="Path to this instance's config.toml. Auto-detected when "
-             "exactly one *.toml file is present in the current directory; "
-             "required (and listed for you) when there's more than one.",
-    )
-    return p.parse_args()
-
-
-def _discover_config_path() -> str:
-    """Resolve the config file to use when --config wasn't given.
-
-    Exactly one *.toml in the current directory -> use it, whatever it's
-    named. Zero or several -> print a plain-English hint (with the exact
-    command to run for each candidate) and exit, rather than guessing.
-    """
-    candidates = sorted(p.name for p in Path(".").glob("*.toml"))
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    if not candidates:
-        print(
-            "No config file found in the current directory (looked for *.toml).\n"
-            "Create one — see config.toml / config.openrouter.toml for examples —\n"
-            "or point at one explicitly:\n"
-            "    python3 main.py --config <path-to-your-config>.toml",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    print(
-        f"Found {len(candidates)} config files in the current directory — "
-        f"pick one with --config:",
-        file=sys.stderr,
-    )
-    for name in candidates:
-        print(f"    python3 main.py --config {name}", file=sys.stderr)
-    sys.exit(1)
-
-
-_args = _parse_args()
-CONFIG_PATH = _args.config or _discover_config_path()
+CONFIG_PATH = "config.toml"
 
 with open(CONFIG_PATH, "rb") as f:
     CONFIG = tomllib.load(f)
 
 HOST = CONFIG["server"]["host"]
 PORT = CONFIG["server"]["port"]
-UPSTREAM_HOST = CONFIG["upstream"]["host"]
+NVIDIA_HOST = CONFIG["upstream"]["host"]
 UPSTREAM_TIMEOUT_SEC = CONFIG["upstream"].get("timeout_sec", 120)
 
 LOG_ENABLED = CONFIG["logging"]["enabled"]
@@ -120,11 +59,30 @@ RETRY_MAX_ATTEMPTS = max(1, int(_RETRY_CFG.get("max_attempts", 3)))  # total tri
 RETRY_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("pause_seconds", 15)))  # fallback when upstream gives no hint
 RETRY_MAX_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("max_pause_seconds", 180)))
 
+# Buffer-and-validate: catches a 200-status body that is truncated or has
+# garbage spliced into it mid-stream (e.g. a stray "HTTP/1.1 502 Bad
+# Gateway" landing inside an SSE data: line) — a failure a status-code
+# check alone can't see. See the long comment in config.toml [retry].
+VALIDATE_RESPONSE_BODY = bool(_RETRY_CFG.get("validate_response_body", False))
+MAX_BUFFER_BYTES = int(_RETRY_CFG.get("max_buffer_bytes", 50_000_000))
+REQUIRE_STREAM_DONE = bool(_RETRY_CFG.get("require_stream_done", True))
+
 # Optional in-process SOCKS5 tunneling. Leave this off if you're already
 # wrapping the process with `proxychains4 python3 main.py`.
 if CONFIG["proxy"]["use_socks5"]:
     import socket
-    import socks  # pip install PySocks
+    try:
+        import socks  # pip install PySocks
+    except ModuleNotFoundError as e:
+        raise SystemExit(
+            "config.toml has [proxy] use_socks5 = true, but the 'PySocks' package "
+            "isn't installed, so this process exits immediately and nothing ever "
+            "binds to the port \u2014 which is exactly what makes Kilo report "
+            "'Cannot connect to API: Unable to connect.'\n"
+            "Fix with:  pip install PySocks\n"
+            "or set use_socks5 = false in config.toml if you launch with "
+            "`proxychains4 python3 main.py` instead."
+        ) from e
 
     socks.set_default_proxy(
         socks.SOCKS5,
@@ -151,6 +109,22 @@ _CLIENT_GONE_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedE
 
 class _ClientGone(Exception):
     pass
+
+
+class _InvalidUpstreamBody(Exception):
+    """Raised when a 200-status upstream body fails structural validation
+    (truncated stream, corrupted/unparsable SSE chunk, or a response
+    bigger than max_buffer_bytes). Carries what we saw so it can be
+    logged and, if the retry budget allows, silently retried exactly like
+    an HTTPError — Kilo never sees the broken bytes.
+    """
+
+    def __init__(self, reason, raw=b"", headers=None, status=None):
+        super().__init__(reason)
+        self.reason = reason
+        self.raw = raw
+        self.headers = headers or []
+        self.status = status
 
 # Console-only running totals — never written to logs/*.jsonl.
 _stats_lock = threading.Lock()
@@ -307,6 +281,39 @@ def _parse_body(raw: bytes, content_type: str):
         return {"raw": raw[:2000].decode(errors="replace")}
 
 
+def _validate_body(content_type: str, raw: bytes):
+    """Check a fully-buffered response body is structurally intact.
+
+    Returns (True, "") if it looks complete, else (False, reason).
+    Mirrors _parse_body's parsing so "valid" here means "Kilo's own
+    OpenAI-compatible client will be able to parse this too".
+    """
+    if not raw:
+        return False, "empty body"
+    if "text/event-stream" in (content_type or ""):
+        saw_done = False
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                saw_done = True
+                continue
+            try:
+                json.loads(payload)
+            except json.JSONDecodeError:
+                return False, "malformed SSE chunk (invalid JSON in a data: line)"
+        if REQUIRE_STREAM_DONE and not saw_done:
+            return False, "stream ended without a closing data: [DONE]"
+        return True, ""
+    try:
+        json.loads(raw.decode())
+        return True, ""
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False, "invalid JSON body"
+
+
 def write_log(entry: dict):
     if not LOG_ENABLED:
         return
@@ -343,10 +350,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             k: v for k, v in self.headers.items()
             if k.lower() not in STRIP_REQUEST_HEADERS
         }
-        upstream_headers["Host"] = UPSTREAM_HOST
+        upstream_headers["Host"] = NVIDIA_HOST
         upstream_headers["Accept-Encoding"] = "identity"
 
-        url = f"https://{UPSTREAM_HOST}{self.path}"
+        url = f"https://{NVIDIA_HOST}{self.path}"
 
         _t0 = time.monotonic()
         in_bytes = len(body)
@@ -358,15 +365,52 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=body or None, headers=upstream_headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_SEC) as resp:
-                    usage, out_bytes = self._relay(req_id, resp.status, resp.getheaders(), resp)
+                    if VALIDATE_RESPONSE_BODY:
+                        usage, out_bytes = self._relay_buffered(req_id, resp.status, resp.getheaders(), resp)
+                    else:
+                        usage, out_bytes = self._relay(req_id, resp.status, resp.getheaders(), resp)
                 _print_stats(req_id, usage, time.monotonic() - _t0, in_bytes, out_bytes)
                 return
             except _ClientGone:
                 return
+            except _InvalidUpstreamBody as e:
+                retrying = attempt < max_attempts
+
+                write_log({
+                    "type": "response",
+                    "id": req_id,
+                    "status": e.status,
+                    "attempt": attempt,
+                    "retrying": retrying,
+                    "validation_error": e.reason,
+                    "headers": dict(e.headers) if e.headers else {},
+                    "body_snippet": e.raw[:2000].decode(errors="replace") if e.raw else None,
+                })
+
+                if retrying:
+                    print(
+                        f".. [{req_id}] upstream {e.status} body failed validation "
+                        f"({e.reason}) \u2014 retry {attempt}/{max_attempts - 1} in "
+                        f"{RETRY_PAUSE_SECONDS:.1f}s (config default; not sent to Kilo)",
+                        flush=True,
+                    )
+                    time.sleep(RETRY_PAUSE_SECONDS)
+                    continue
+
+                _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, len(e.raw))
+
+                # Retry budget used up on a body that never came back
+                # intact. Forwarding it as-is is exactly the bug we're
+                # fixing (Kilo choking on a spliced-in "HTTP/1.1 502 Bad
+                # Gateway" mid-JSON-string) — mask it the same predictable
+                # way as an exhausted status-code retry instead.
+                self._write_masked_retry(req_id, f"malformed body: {e.reason}")
+                return
             except urllib.error.HTTPError as e:
                 err_body = e.read()
                 headers = list(e.headers.items()) if e.headers else []
-                retrying = RETRY_ENABLED and e.code in RETRY_STATUS_CODES and attempt < max_attempts
+                code_is_retryable = e.code in RETRY_STATUS_CODES
+                retrying = RETRY_ENABLED and code_is_retryable and attempt < max_attempts
 
                 pause = pause_source = None
                 if retrying:
@@ -404,7 +448,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     continue
 
                 _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, len(err_body))
-                self._write_final(req_id, e.code, headers, err_body, "error_forward")
+
+                if RETRY_ENABLED and code_is_retryable:
+                    # Silent-retry budget is used up (or the resolved wait
+                    # looked like a quota reset). Kilo never sees the real
+                    # status or body here — upstreams shove this family of
+                    # errors into wildly different shapes (bare 5xx bodies,
+                    # {"name":"UnknownError","data":{...}}, etc.) and Kilo
+                    # copes with a plain 429 + Retry-After far better than
+                    # with whichever shape happened to come back last. The
+                    # real status/body is still in the log above.
+                    self._write_masked_retry(req_id, e.code)
+                else:
+                    self._write_final(req_id, e.code, headers, err_body, "error_forward")
                 return
             except Exception as e:
                 print(f"!! [{req_id}] {type(e).__name__}: {e}", flush=True)
@@ -412,6 +468,42 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, 0)
                 self._write_final(req_id, 502, [], str(e).encode(), "network_error")
                 return
+
+    def _write_masked_retry(self, req_id, original_code):
+        """Send Kilo one predictable shape after we give up retrying.
+
+        original_code is whatever the upstream actually sent (500, 502,
+        529, ...) — logged, but never forwarded. Kilo only ever sees a
+        plain 429 with a Retry-After header pulled straight from config
+        ([retry] pause_seconds), so it backs off the same way regardless
+        of which unfamiliar error shape the upstream used underneath.
+        """
+        retry_after = int(round(RETRY_PAUSE_SECONDS))
+        body = json.dumps({
+            "error": {
+                "message": f"Upstream temporarily unavailable (was {original_code}). Retry after {retry_after}s.",
+                "type": "rate_limit_error",
+                "code": 429,
+            }
+        }).encode()
+        headers = [
+            ("Content-Type", "application/json"),
+            ("Retry-After", str(retry_after)),
+        ]
+        print(
+            f".. [{req_id}] retries exhausted on upstream {original_code} \u2014 "
+            f"masking to Kilo as 429 + Retry-After: {retry_after}s",
+            flush=True,
+        )
+        write_log({
+            "type": "response",
+            "id": req_id,
+            "status": 429,
+            "masked_from": original_code,
+            "headers": dict(headers),
+            "body": json.loads(body),
+        })
+        self._write_final(req_id, 429, headers, body, "retry_exhausted_masked")
 
     def _write_final(self, req_id, status, headers, body_bytes, stage):
         """Send a final (non-streamed) response. Returns True on success.
@@ -463,7 +555,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         except _CLIENT_GONE_ERRORS:
             # Kilo hung up mid-response (its own client-side timeout is
             # the usual cause after a long retry sequence). Drain what
-            # Example already sent so its connection closes cleanly, log
+            # NVIDIA already sent so its connection closes cleanly, log
             # it once, and stop — nothing more can be written to Kilo.
             try:
                 fp.read()
@@ -483,6 +575,65 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         })
         return _extract_usage(parsed_body), total_len
 
+    def _relay_buffered(self, req_id, status, headers, fp):
+        """Buffer the whole upstream body, validate it, THEN send it on.
+
+        Unlike _relay (which streams live, chunk by chunk, so Kilo can
+        already have half a broken response by the time anything looks
+        wrong), nothing is written to Kilo here until the full body has
+        been read and passed _validate_body. That's what makes a genuine
+        silent retry possible for a body that's corrupted or truncated
+        mid-stream: on failure this raises _InvalidUpstreamBody instead
+        of touching self.wfile, so the caller can just try again.
+        """
+        content_type = _get_ci(headers, "Content-Type")
+        captured = bytearray()
+        over_limit = False
+
+        while True:
+            chunk = fp.read(65536)
+            if not chunk:
+                break
+            if len(captured) + len(chunk) > MAX_BUFFER_BYTES:
+                over_limit = True
+                break
+            captured.extend(chunk)
+
+        if over_limit:
+            raise _InvalidUpstreamBody(
+                f"response exceeded max_buffer_bytes ({MAX_BUFFER_BYTES})",
+                headers=headers, status=status,
+            )
+
+        raw = bytes(captured)
+        ok, reason = _validate_body(content_type, raw)
+        if not ok:
+            raise _InvalidUpstreamBody(reason, raw=raw, headers=headers, status=status)
+
+        try:
+            self.send_response(status)
+            for key, val in headers:
+                if key.lower() not in STRIP_RESPONSE_HEADERS:
+                    self.send_header(key, val)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(raw)
+            self.wfile.flush()
+        except _CLIENT_GONE_ERRORS:
+            print(f"xx [{req_id}] client disconnected before the validated response could be sent", flush=True)
+            write_log({"type": "client_disconnected", "id": req_id, "stage": "relay_buffered"})
+            raise _ClientGone from None
+
+        parsed_body = _parse_body(raw[:LOG_BODY_LIMIT], content_type)
+        write_log({
+            "type": "response",
+            "id": req_id,
+            "status": status,
+            "headers": dict(headers),
+            "body": parsed_body,
+        })
+        return _extract_usage(parsed_body), len(raw)
+
     def do_POST(self):
         self._proxy("POST")
 
@@ -500,11 +651,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer((HOST, PORT), ProxyHandler)
-    print(
-        f"proxy listening on http://{HOST}:{PORT}  ->  https://{UPSTREAM_HOST}  "
-        f"(config={CONFIG_PATH}, logs -> {LOG_DIR}/*.jsonl)",
-        flush=True,
-    )
+    print(f"NVIDIA proxy listening on http://{HOST}:{PORT}  (logs -> {LOG_DIR}/*.jsonl)", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

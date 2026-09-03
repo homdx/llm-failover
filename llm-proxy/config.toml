@@ -25,15 +25,34 @@ body_limit_bytes = 200000
 # and silently re-send the same request — Kilo only ever sees the final
 # outcome, never the failed attempt(s).
 enabled = true
-status_codes = [400, 425]
-max_attempts = 3       # total tries, including the first — so 2 retries here
+status_codes = [400, 425, 429, 500, 502, 529 ]
+max_attempts = 10       # total tries, including the first — so 2 retries here
 # pause_seconds is only the FALLBACK wait: if the upstream response has a
 # Retry-After header, or a "try again in Xms" / "retry in Xs" hint in the
 # error body, that number is used instead — pause_seconds only applies
-# when neither is present.
+# when neither is present. 500/502/529 almost never carry a Retry-After
+# header or a body hint, so in practice this 30s fallback IS the wait for
+# those three.
 pause_seconds = 15
 # A resolved wait longer than this (header or body hint) is treated as a
 # quota reset rather than a transient limit — the error is forwarded to
 # Kilo immediately instead of holding its connection open that long.
 max_pause_seconds = 180
-
+# Buffer the WHOLE upstream response and check it's structurally intact
+# before sending anything to Kilo. This is what makes a real silent
+# retry possible on a body that's corrupted or truncated MID-stream (a
+# stray status line spliced into an SSE chunk, etc.) — a failure a
+# status-code check alone can't see, because the initial status was a
+# plain 200. Trade-off: Kilo no longer gets live token-by-token output,
+# it gets the whole response at once, after upstream finishes.
+validate_response_body = true
+# Memory safety valve — a response bigger than this skips buffering and
+# is treated as a failure outright (retried if attempts remain, else
+# forwarded/masked like any other failure). Shouldn't trigger for normal
+# chat completions.
+max_buffer_bytes = 50000000
+# An SSE stream that just stops without a closing "data: [DONE]" counts
+# as truncated, even if every line seen so far was individually valid
+# JSON. Turn off if your upstream/model never sends one.
+require_stream_done = false
+#true
