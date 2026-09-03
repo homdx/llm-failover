@@ -18,10 +18,12 @@ Point Kilo's baseUrl at:
     http://<server.host>:<server.port>/v1   (see config.toml — currently 127.0.0.1:8081)
 """
 
+import http.client
 import http.server
 import json
 import os
 import re
+import ssl
 import threading
 import time
 import urllib.error
@@ -66,6 +68,17 @@ RETRY_MAX_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("max_pause_seconds", 180
 VALIDATE_RESPONSE_BODY = bool(_RETRY_CFG.get("validate_response_body", False))
 MAX_BUFFER_BYTES = int(_RETRY_CFG.get("max_buffer_bytes", 50_000_000))
 REQUIRE_STREAM_DONE = bool(_RETRY_CFG.get("require_stream_done", True))
+# A completions stream that stops before ANY chunk carries a finish_reason
+# was cut off mid-generation, even though every line in it parsed as valid
+# JSON and the status was 200. This is what a response killed during a long
+# reasoning phase actually looks like on the wire, and it is detectable
+# whether or not the upstream bothers to send a closing "data: [DONE]".
+REQUIRE_STREAM_FINISH_REASON = bool(_RETRY_CFG.get("require_stream_finish_reason", True))
+# A truncated body is not a rate limit, so it does not deserve the
+# rate-limit-sized wait: pausing pause_seconds before each of max_attempts
+# retries here would hold the client for minutes over a hiccup that clears
+# in one retry.
+BODY_RETRY_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("body_retry_pause_seconds", 2.0)))
 
 # Optional in-process SOCKS5 tunneling. Leave this off if you're already
 # wrapping the process with `proxychains4 python3 main.py`.
@@ -113,18 +126,35 @@ class _ClientGone(Exception):
 
 class _InvalidUpstreamBody(Exception):
     """Raised when a 200-status upstream body fails structural validation
-    (truncated stream, corrupted/unparsable SSE chunk, or a response
-    bigger than max_buffer_bytes). Carries what we saw so it can be
+    (truncated stream, corrupted/unparsable SSE chunk, or the connection
+    dying part-way through the body). Carries what we saw so it can be
     logged and, if the retry budget allows, silently retried exactly like
     an HTTPError — Kilo never sees the broken bytes.
     """
 
-    def __init__(self, reason, raw=b"", headers=None, status=None):
+    def __init__(self, reason, raw=b"", headers=None, status=None, retryable=True):
         super().__init__(reason)
         self.reason = reason
         self.raw = raw
         self.headers = headers or []
         self.status = status
+        self.retryable = retryable
+
+
+# Errors that mean "the upstream body stopped arriving part-way through".
+# http.client raises IncompleteRead when a declared Content-Length or a
+# chunked body ends early; a stalled generation trips the socket timeout;
+# a dropped TLS connection surfaces as SSLError/OSError. All of them are
+# the same event as far as this proxy is concerned: a truncated response.
+# TimeoutError and the ConnectionError family are OSError subclasses, so
+# OSError is the catch-all backstop rather than a separate case.
+_UPSTREAM_READ_ERRORS = (
+    http.client.IncompleteRead,
+    http.client.HTTPException,
+    ssl.SSLError,
+    TimeoutError,
+    OSError,
+)
 
 # Console-only running totals — never written to logs/*.jsonl.
 _stats_lock = threading.Lock()
@@ -281,31 +311,74 @@ def _parse_body(raw: bytes, content_type: str):
         return {"raw": raw[:2000].decode(errors="replace")}
 
 
-def _validate_body(content_type: str, raw: bytes):
+# Statuses that carry no body at all by definition — an empty body for
+# one of these is a complete response, not a truncated one.
+_BODILESS_STATUSES = {204, 205, 304}
+
+
+def _validate_sse(raw: bytes):
+    """Structural check for a fully-buffered text/event-stream body."""
+    saw_done = False
+    saw_choices = False
+    saw_finish_reason = False
+
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            saw_done = True
+            continue
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            return False, "malformed SSE chunk (invalid JSON in a data: line)"
+        choices = chunk.get("choices") if isinstance(chunk, dict) else None
+        if isinstance(choices, list) and choices:
+            saw_choices = True
+            for choice in choices:
+                if isinstance(choice, dict) and choice.get("finish_reason"):
+                    saw_finish_reason = True
+
+    if REQUIRE_STREAM_DONE and not saw_done:
+        return False, "stream ended without a closing data: [DONE]"
+    # The truncation that a per-line JSON check cannot see: the stream
+    # stopped on a clean chunk boundary, so every line parsed, but no
+    # chunk ever reported why generation ended. That is a response cut
+    # off mid-flight (reasoning tokens ran past the gateway's patience,
+    # upstream hung up, ...) rather than a finished one. Only applied to
+    # completion-shaped streams, and only when there is no [DONE] either
+    # — an upstream that closed the stream properly is taken at its word.
+    if (REQUIRE_STREAM_FINISH_REASON and saw_choices
+            and not saw_finish_reason and not saw_done):
+        return False, "stream ended mid-generation (no finish_reason in any chunk)"
+    return True, ""
+
+
+def _validate_body(content_type: str, raw: bytes, status: int = 200,
+                   method: str = "POST", declared_length=None):
     """Check a fully-buffered response body is structurally intact.
 
     Returns (True, "") if it looks complete, else (False, reason).
     Mirrors _parse_body's parsing so "valid" here means "Kilo's own
     OpenAI-compatible client will be able to parse this too".
+
+    status/method/declared_length exist so a legitimately empty body
+    (204/304, a HEAD, an explicit Content-Length: 0) is not mistaken for
+    a truncated one and retried into a fabricated 429.
     """
+    ct = (content_type or "").lower()
+
+    if status in _BODILESS_STATUSES or method.upper() == "HEAD" or declared_length == 0:
+        return True, ""
     if not raw:
         return False, "empty body"
-    if "text/event-stream" in (content_type or ""):
-        saw_done = False
-        for line in raw.decode("utf-8", errors="replace").splitlines():
-            line = line.strip()
-            if not line.startswith("data:"):
-                continue
-            payload = line[len("data:"):].strip()
-            if payload == "[DONE]":
-                saw_done = True
-                continue
-            try:
-                json.loads(payload)
-            except json.JSONDecodeError:
-                return False, "malformed SSE chunk (invalid JSON in a data: line)"
-        if REQUIRE_STREAM_DONE and not saw_done:
-            return False, "stream ended without a closing data: [DONE]"
+    if "text/event-stream" in ct:
+        return _validate_sse(raw)
+    if ct and "json" not in ct:
+        # Not a shape this proxy knows how to check (text/plain health
+        # endpoints and the like) — don't invent a failure for it.
         return True, ""
     try:
         json.loads(raw.decode())
@@ -329,11 +402,19 @@ def write_log(entry: dict):
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    # True once a status line has gone out to the client for the request
+    # in flight. Nothing may write a second response after that: doing so
+    # splices a raw "HTTP/1.1 502 Bad Gateway" into the middle of the body
+    # the client is still reading, which is exactly the corrupted-SSE
+    # symptom this proxy is supposed to protect against.
+    _response_started = False
+
     def log_message(self, format, *args):
         pass  # console output is now just the per-request stats line below
 
     def _proxy(self, method):
         req_id = uuid.uuid4().hex[:8]
+        self._response_started = False
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b""
 
@@ -366,7 +447,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             try:
                 with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_SEC) as resp:
                     if VALIDATE_RESPONSE_BODY:
-                        usage, out_bytes = self._relay_buffered(req_id, resp.status, resp.getheaders(), resp)
+                        usage, out_bytes = self._relay_buffered(
+                            req_id, resp.status, resp.getheaders(), resp, method)
                     else:
                         usage, out_bytes = self._relay(req_id, resp.status, resp.getheaders(), resp)
                 _print_stats(req_id, usage, time.monotonic() - _t0, in_bytes, out_bytes)
@@ -374,7 +456,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except _ClientGone:
                 return
             except _InvalidUpstreamBody as e:
-                retrying = attempt < max_attempts
+                retrying = RETRY_ENABLED and e.retryable and attempt < max_attempts
 
                 write_log({
                     "type": "response",
@@ -391,10 +473,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     print(
                         f".. [{req_id}] upstream {e.status} body failed validation "
                         f"({e.reason}) \u2014 retry {attempt}/{max_attempts - 1} in "
-                        f"{RETRY_PAUSE_SECONDS:.1f}s (config default; not sent to Kilo)",
+                        f"{BODY_RETRY_PAUSE_SECONDS:.1f}s (config default; not sent to Kilo)",
                         flush=True,
                     )
-                    time.sleep(RETRY_PAUSE_SECONDS)
+                    time.sleep(BODY_RETRY_PAUSE_SECONDS)
                     continue
 
                 _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, len(e.raw))
@@ -469,11 +551,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self._write_final(req_id, 502, [], str(e).encode(), "network_error")
                 return
 
-    def _write_masked_retry(self, req_id, original_code):
+    def _write_masked_retry(self, req_id, original):
         """Send Kilo one predictable shape after we give up retrying.
 
-        original_code is whatever the upstream actually sent (500, 502,
-        529, ...) — logged, but never forwarded. Kilo only ever sees a
+        `original` is whatever actually went wrong — an upstream status
+        code (500, 502, 529, ...) or a body-validation reason. It is
+        logged, but never forwarded. Kilo only ever sees a
         plain 429 with a Retry-After header pulled straight from config
         ([retry] pause_seconds), so it backs off the same way regardless
         of which unfamiliar error shape the upstream used underneath.
@@ -481,7 +564,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         retry_after = int(round(RETRY_PAUSE_SECONDS))
         body = json.dumps({
             "error": {
-                "message": f"Upstream temporarily unavailable (was {original_code}). Retry after {retry_after}s.",
+                "message": f"Upstream temporarily unavailable (was {original}). Retry after {retry_after}s.",
                 "type": "rate_limit_error",
                 "code": 429,
             }
@@ -491,7 +574,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             ("Retry-After", str(retry_after)),
         ]
         print(
-            f".. [{req_id}] retries exhausted on upstream {original_code} \u2014 "
+            f".. [{req_id}] retries exhausted on upstream {original} \u2014 "
             f"masking to Kilo as 429 + Retry-After: {retry_after}s",
             flush=True,
         )
@@ -499,11 +582,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "type": "response",
             "id": req_id,
             "status": 429,
-            "masked_from": original_code,
+            "masked_from": original,
             "headers": dict(headers),
             "body": json.loads(body),
         })
         self._write_final(req_id, 429, headers, body, "retry_exhausted_masked")
+
+    def _start_response(self, status, headers):
+        """Write the status line and headers, and latch _response_started."""
+        self.send_response(status)
+        for key, val in headers:
+            if key.lower() not in STRIP_RESPONSE_HEADERS:
+                self.send_header(key, val)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self._response_started = True
 
     def _write_final(self, req_id, status, headers, body_bytes, stage):
         """Send a final (non-streamed) response. Returns True on success.
@@ -513,13 +606,21 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         False instead of letting a second, unhandled exception crash the
         request thread on top of whatever originally went wrong.
         """
+        if self._response_started:
+            # A response is already on the wire (usually a streamed 200
+            # that upstream then truncated). Appending another status
+            # line here would corrupt the body the client is mid-way
+            # through parsing; all that's left to do is stop.
+            print(
+                f"xx [{req_id}] upstream failed after the response had already "
+                f"started \u2014 not writing a {status} on top of it",
+                flush=True,
+            )
+            write_log({"type": "response_aborted", "id": req_id,
+                       "stage": stage, "would_have_sent": status})
+            return False
         try:
-            self.send_response(status)
-            for key, val in headers:
-                if key.lower() not in STRIP_RESPONSE_HEADERS:
-                    self.send_header(key, val)
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._start_response(status, headers)
             self.wfile.write(body_bytes)
             return True
         except _CLIENT_GONE_ERRORS:
@@ -529,12 +630,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _relay(self, req_id, status, headers, fp):
         try:
-            self.send_response(status)
-            for key, val in headers:
-                if key.lower() not in STRIP_RESPONSE_HEADERS:
-                    self.send_header(key, val)
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._start_response(status, headers)
 
             content_type = _get_ci(headers, "Content-Type")
             captured = bytearray()
@@ -575,7 +671,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         })
         return _extract_usage(parsed_body), total_len
 
-    def _relay_buffered(self, req_id, status, headers, fp):
+    def _relay_buffered(self, req_id, status, headers, fp, method="POST"):
         """Buffer the whole upstream body, validate it, THEN send it on.
 
         Unlike _relay (which streams live, chunk by chunk, so Kilo can
@@ -587,36 +683,48 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         of touching self.wfile, so the caller can just try again.
         """
         content_type = _get_ci(headers, "Content-Type")
+        try:
+            declared_length = int(_get_ci(headers, "Content-Length"))
+        except (TypeError, ValueError):
+            declared_length = None
+
         captured = bytearray()
-        over_limit = False
-
-        while True:
-            chunk = fp.read(65536)
-            if not chunk:
-                break
-            if len(captured) + len(chunk) > MAX_BUFFER_BYTES:
-                over_limit = True
-                break
-            captured.extend(chunk)
-
-        if over_limit:
+        try:
+            while True:
+                chunk = fp.read(65536)
+                if not chunk:
+                    break
+                captured.extend(chunk)
+                if len(captured) > MAX_BUFFER_BYTES:
+                    # Too big to hold for validation. Deliver it anyway —
+                    # an over-sized response is still a response, and
+                    # turning it into a fabricated 429 (or retrying it,
+                    # which just produces another over-sized response)
+                    # helps nobody.
+                    return self._passthrough(
+                        req_id, status, headers, bytes(captured), fp, content_type)
+        except _UPSTREAM_READ_ERRORS as e:
+            # The body stopped arriving part-way through: a long reasoning
+            # phase outran the gateway, upstream hung up, the socket timed
+            # out. Nothing has been written to the client yet, so this is
+            # retryable exactly like a body that arrived complete but
+            # unparsable — which is the whole point of buffering. Without
+            # this branch the exception escapes to the generic handler,
+            # which sends a bare 502 and does not retry at all.
+            captured.extend(getattr(e, "partial", b"") or b"")
             raise _InvalidUpstreamBody(
-                f"response exceeded max_buffer_bytes ({MAX_BUFFER_BYTES})",
-                headers=headers, status=status,
-            )
+                f"upstream connection failed mid-body ({type(e).__name__}: {e})",
+                raw=bytes(captured), headers=headers, status=status,
+            ) from None
 
         raw = bytes(captured)
-        ok, reason = _validate_body(content_type, raw)
+        ok, reason = _validate_body(content_type, raw, status=status,
+                                    method=method, declared_length=declared_length)
         if not ok:
             raise _InvalidUpstreamBody(reason, raw=raw, headers=headers, status=status)
 
         try:
-            self.send_response(status)
-            for key, val in headers:
-                if key.lower() not in STRIP_RESPONSE_HEADERS:
-                    self.send_header(key, val)
-            self.send_header("Connection", "close")
-            self.end_headers()
+            self._start_response(status, headers)
             self.wfile.write(raw)
             self.wfile.flush()
         except _CLIENT_GONE_ERRORS:
@@ -633,6 +741,54 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "body": parsed_body,
         })
         return _extract_usage(parsed_body), len(raw)
+
+    def _passthrough(self, req_id, status, headers, prefix, fp, content_type):
+        """Stream an over-sized response through without validating it.
+
+        Reached only when the body grew past max_buffer_bytes mid-read:
+        the bytes already buffered go out first, then the rest is relayed
+        live. Validation is impossible from here, so this deliberately
+        gives up on retrying rather than on delivering.
+        """
+        print(
+            f".. [{req_id}] response passed max_buffer_bytes ({MAX_BUFFER_BYTES}) "
+            f"\u2014 streaming it through unvalidated",
+            flush=True,
+        )
+        total_len = len(prefix)
+        try:
+            self._start_response(status, headers)
+            self.wfile.write(prefix)
+            self.wfile.flush()
+            while True:
+                chunk = fp.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                total_len += len(chunk)
+        except _CLIENT_GONE_ERRORS:
+            print(f"xx [{req_id}] client disconnected mid-response", flush=True)
+            write_log({"type": "client_disconnected", "id": req_id, "stage": "passthrough"})
+            raise _ClientGone from None
+        except _UPSTREAM_READ_ERRORS as e:
+            # Half-delivered and unrecoverable: _response_started is set,
+            # so the caller's error handler will log this without writing
+            # a second status line over the body already in flight.
+            write_log({"type": "error", "id": req_id, "stage": "passthrough",
+                       "error": f"{type(e).__name__}: {e}"})
+            raise
+
+        parsed_body = _parse_body(prefix[:LOG_BODY_LIMIT], content_type)
+        write_log({
+            "type": "response",
+            "id": req_id,
+            "status": status,
+            "validated": False,
+            "headers": dict(headers),
+            "body": parsed_body,
+        })
+        return _extract_usage(parsed_body), total_len
 
     def do_POST(self):
         self._proxy("POST")

@@ -46,13 +46,28 @@ max_pause_seconds = 180
 # plain 200. Trade-off: Kilo no longer gets live token-by-token output,
 # it gets the whole response at once, after upstream finishes.
 validate_response_body = true
-# Memory safety valve — a response bigger than this skips buffering and
-# is treated as a failure outright (retried if attempts remain, else
-# forwarded/masked like any other failure). Shouldn't trigger for normal
-# chat completions.
+# Memory safety valve — once a response grows past this, it stops being
+# buffered and is streamed straight through to the client instead, with
+# no body validation (there is nothing left to validate against). It is
+# NOT treated as a failure: an over-sized response is still a response.
+# Shouldn't trigger for normal chat completions.
 max_buffer_bytes = 50000000
 # An SSE stream that just stops without a closing "data: [DONE]" counts
 # as truncated, even if every line seen so far was individually valid
 # JSON. Turn off if your upstream/model never sends one.
 require_stream_done = false
-#true
+# The check that still catches a truncated stream when require_stream_done
+# is off: a completions stream in which no chunk ever reported a
+# finish_reason was cut off mid-generation. This is what a response killed
+# during a long reasoning phase looks like — the status is 200, every
+# data: line parses, and only the missing finish_reason gives it away.
+# Only applied to completion-shaped streams, and never when a closing
+# [DONE] arrived. Turn off only if your upstream omits finish_reason
+# entirely.
+require_stream_finish_reason = true
+# Wait before re-sending after a FAILED BODY (as opposed to a failed
+# status code). A truncated body is not a rate limit, so it doesn't want
+# the rate-limit-sized pause: with max_attempts = 10, reusing
+# pause_seconds here would hold the client for 135s on a hiccup that
+# usually clears on the first retry.
+body_retry_pause_seconds = 2
