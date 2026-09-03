@@ -147,6 +147,18 @@ class _ClientGone(Exception):
     pass
 
 
+class _ResponseAborted(Exception):
+    """The response had already started (status line + some body sent to
+    Kilo) when the upstream connection failed. There is nothing safe left
+    to do — retrying would mean sending a second status line into the
+    middle of a body Kilo is already reading, which is the exact
+    corruption this proxy exists to prevent. So: stop, log it plainly,
+    and never treat it as retryable. Deliberately not _ClientGone: the
+    client didn't necessarily go anywhere, the upstream did.
+    """
+    pass
+
+
 class _InvalidUpstreamBody(Exception):
     """Raised when a 200-status upstream body fails structural validation
     (truncated stream, corrupted/unparsable SSE chunk, or the connection
@@ -625,6 +637,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 return
             except _ClientGone:
                 return
+            except _ResponseAborted:
+                return
             except _InvalidUpstreamBody as e:
                 retrying = RETRY_ENABLED and e.retryable and attempt < max_attempts
                 if retrying and deadline is not None and \
@@ -896,6 +910,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             declared_length = None
 
         captured = bytearray()
+        over_limit = False
         try:
             while True:
                 chunk = fp.read(65536)
@@ -907,9 +922,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # an over-sized response is still a response, and
                     # turning it into a fabricated 429 (or retrying it,
                     # which just produces another over-sized response)
-                    # helps nobody.
-                    return self._passthrough(
-                        req_id, status, headers, bytes(captured), fp, content_type)
+                    # helps nobody. Handled OUTSIDE this try block (see
+                    # below): once _passthrough starts writing to the
+                    # client, a failure in it is no longer a "nothing sent
+                    # yet, safe to retry" case like the one this except
+                    # clause exists for.
+                    over_limit = True
+                    break
         except _UPSTREAM_READ_ERRORS as e:
             # The body stopped arriving part-way through: a long reasoning
             # phase outran the gateway, upstream hung up, the socket timed
@@ -923,6 +942,10 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 f"upstream connection failed mid-body ({type(e).__name__}: {e})",
                 raw=bytes(captured), headers=headers, status=status,
             ) from None
+
+        if over_limit:
+            return self._passthrough(
+                req_id, status, headers, bytes(captured), fp, content_type)
 
         raw = bytes(captured)
         ok, reason = _validate_body(content_type, raw, status=status,
@@ -975,16 +998,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
                 total_len += len(chunk)
         except _CLIENT_GONE_ERRORS:
-            print(f"xx [{req_id}] client disconnected mid-response", flush=True)
-            write_log({"type": "client_disconnected", "id": req_id, "stage": "passthrough"})
-            raise _ClientGone from None
+            # NOTE: this same error type can also arise from fp.read() —
+            # a reset upstream connection and a reset client connection
+            # raise identical exception types, and both can occur inside
+            # this one try block (it mixes reads from upstream with
+            # writes to the client). There's no reliable way to tell them
+            # apart from the exception alone, so this is reported as
+            # "connection lost mid-response" rather than confidently
+            # blamed on the client.
+            print(f"xx [{req_id}] connection lost mid-response (passthrough)", flush=True)
+            write_log({"type": "response_aborted", "id": req_id, "stage": "passthrough"})
+            raise _ResponseAborted from None
         except _UPSTREAM_READ_ERRORS as e:
             # Half-delivered and unrecoverable: _response_started is set,
-            # so the caller's error handler will log this without writing
-            # a second status line over the body already in flight.
-            write_log({"type": "error", "id": req_id, "stage": "passthrough",
+            # so this must never be recast as a retryable _InvalidUpstreamBody
+            # (that would retry the request and call _start_response a
+            # second time on top of the bytes already sent — a corrupted
+            # response, which is exactly the bug this proxy exists to fix).
+            print(
+                f"xx [{req_id}] upstream failed mid-passthrough after the "
+                f"response had already started ({type(e).__name__}: {e})",
+                flush=True,
+            )
+            write_log({"type": "response_aborted", "id": req_id, "stage": "passthrough",
                        "error": f"{type(e).__name__}: {e}"})
-            raise
+            raise _ResponseAborted from None
 
         parsed_body = _parse_body(prefix[:LOG_BODY_LIMIT], content_type)
         write_log({
