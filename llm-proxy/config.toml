@@ -71,3 +71,30 @@ require_stream_finish_reason = true
 # pause_seconds here would hold the client for 135s on a hiccup that
 # usually clears on the first retry.
 body_retry_pause_seconds = 2
+
+# --- keeping parallel requests from fighting each other over a rate limit ---
+# Kilo runs several requests at once and each one retries in its own
+# thread, so without these the proxy answers an upstream "slow down" by
+# sending more traffic, not less: 5 requests x 10 attempts inside the same
+# window the upstream asked everyone to sit out.
+#
+# How many requests may be talking to the upstream at once. 0 = unlimited
+# (the old behaviour). Set this to the number of parallel requests the
+# provider actually tolerates — for a single free-tier key that is usually
+# 1 or 2. Extra requests queue instead of piling onto the limit.
+max_concurrent_upstream = 2
+# Ceiling on how long ONE request may spend retrying before it answers the
+# client. 0 = unlimited (the old behaviour). Keep it under the client's own
+# timeout: retrying for 63s when Kilo gave up at 30s means the answer is
+# written to a socket nobody is reading. Kilo handles a 429 + Retry-After
+# perfectly well, so handing control back early is the better trade.
+max_total_retry_seconds = 45
+# Random spread applied when queued requests come off a shared cooldown,
+# so they don't all fire on the same instant and re-trigger the limit.
+cooldown_jitter_seconds = 0.5
+# Growth factor for the FALLBACK wait (pause_seconds) across attempts
+# within one request — 15s, 30s, 60s... capped by max_pause_seconds. Only
+# applies when the upstream gave no Retry-After header and no body hint;
+# an explicit number from the upstream is always honoured as given.
+# 1.0 = flat, the old behaviour.
+backoff_factor = 2.0

@@ -22,6 +22,7 @@ import http.client
 import http.server
 import json
 import os
+import random
 import re
 import ssl
 import threading
@@ -79,6 +80,28 @@ REQUIRE_STREAM_FINISH_REASON = bool(_RETRY_CFG.get("require_stream_finish_reason
 # retries here would hold the client for minutes over a hiccup that clears
 # in one retry.
 BODY_RETRY_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("body_retry_pause_seconds", 2.0)))
+
+# --- keeping parallel requests from fighting each other over a rate limit ---
+# Each in-flight request runs in its own thread with its own retry loop, so
+# without these three the proxy answers an upstream "slow down" by sending
+# MORE traffic: N requests x max_attempts tries, all inside the window the
+# upstream just asked everyone to sit out.
+#
+# max_concurrent_upstream caps how many requests may be talking to the
+# upstream at once (0 = unlimited, the old behaviour).
+MAX_CONCURRENT_UPSTREAM = max(0, int(_RETRY_CFG.get("max_concurrent_upstream", 0)))
+# Hard ceiling on how long one request may spend retrying before it gives
+# up and answers the client (0 = unlimited, the old behaviour). Retrying
+# past the client's own timeout is wasted effort: it has stopped listening.
+MAX_TOTAL_RETRY_SECONDS = max(0.0, float(_RETRY_CFG.get("max_total_retry_seconds", 0)))
+# Random spread applied when threads come off a shared cooldown, so they
+# don't all fire at the same instant and re-trigger the limit together.
+COOLDOWN_JITTER_SECONDS = max(0.0, float(_RETRY_CFG.get("cooldown_jitter_seconds", 0.5)))
+# Growth factor for the FALLBACK wait only (pause_seconds, used when the
+# upstream gave no Retry-After and no body hint) across attempts within one
+# request. An explicit upstream number is always honoured as-is. Capped by
+# max_pause_seconds. 1.0 = flat, the old behaviour.
+RETRY_BACKOFF_FACTOR = max(1.0, float(_RETRY_CFG.get("backoff_factor", 2.0)))
 
 # Optional in-process SOCKS5 tunneling. Leave this off if you're already
 # wrapping the process with `proxychains4 python3 main.py`.
@@ -279,6 +302,133 @@ def _resolve_pause(headers, err_body: bytes, default_seconds: float):
     return default_seconds, "config default"
 
 
+# ---------------------------------------------------------------------------
+# Shared cooldown gate.
+#
+# A rate limit belongs to the account, not to one request, so the wait it
+# asks for has to be observed by every thread — otherwise thread A sleeps
+# out its 5 seconds while threads B..E keep hammering the same limit, and
+# the limit never gets a chance to clear. One deadline, set by whoever hit
+# the limit most recently, respected by everyone before their next attempt.
+# ---------------------------------------------------------------------------
+_gate_lock = threading.Lock()
+_gate_until = 0.0  # time.monotonic() deadline; no upstream call before this
+# Held by the one request allowed to test the upstream when a cooldown
+# lifts. Without it, every queued thread fires the instant the deadline
+# passes and the limit is hit N times over to learn one fact.
+_probe_lock = threading.Lock()
+_upstream_slots = (
+    threading.BoundedSemaphore(MAX_CONCURRENT_UPSTREAM)
+    if MAX_CONCURRENT_UPSTREAM > 0 else None
+)
+
+
+def _gate_penalize(seconds: float):
+    """Stand every thread down for `seconds`. Never shortens an existing wait."""
+    global _gate_until
+    if seconds <= 0:
+        return
+    deadline = time.monotonic() + seconds
+    with _gate_lock:
+        if deadline > _gate_until:
+            _gate_until = deadline
+
+
+def _gate_remaining() -> float:
+    with _gate_lock:
+        return max(0.0, _gate_until - time.monotonic())
+
+
+def _gate_clear():
+    """A request got through, so the limit isn't in force any more.
+
+    If that read was wrong the very next 429 re-arms the gate, which costs
+    one wasted request — cheaper than making everyone sit out a cooldown
+    that has already expired.
+    """
+    global _gate_until
+    with _gate_lock:
+        _gate_until = 0.0
+
+
+def _await_turn(req_id, deadline=None):
+    """Wait for the shared cooldown, then for permission to go upstream.
+
+    Returns (ok, probing). ok is False when waiting any longer would blow
+    this request's time budget — the caller answers the client instead.
+
+    While no cooldown is in force this returns immediately and requests
+    run in parallel as before. Coming OUT of a cooldown is the part that
+    matters: exactly one request (the probe) is let through to find out
+    whether the limit has lifted. If it gets another 429 the gate is
+    re-armed and everyone keeps waiting, so the upstream sees one request
+    per window instead of one per waiting thread. Whoever holds the probe
+    must hand it back with _end_turn().
+    """
+    waited = False
+    while True:
+        remaining = _gate_remaining()
+        if remaining > 0:
+            if deadline is not None and time.monotonic() + remaining > deadline:
+                return False, False
+            if not waited:
+                print(
+                    f".. [{req_id}] shared cooldown active ({remaining:.1f}s left) "
+                    f"\u2014 holding before contacting upstream",
+                    flush=True,
+                )
+                waited = True
+            time.sleep(min(remaining, 0.5))
+            continue
+
+        if not waited:
+            return True, False
+
+        if _probe_lock.acquire(blocking=False):
+            if _gate_remaining() > 0:
+                # Re-armed by another thread between the two checks.
+                _probe_lock.release()
+                continue
+            if COOLDOWN_JITTER_SECONDS:
+                time.sleep(random.uniform(0.0, COOLDOWN_JITTER_SECONDS))
+            return True, True
+
+        # Someone else is probing. Wait for their verdict rather than
+        # duplicating it.
+        if deadline is not None and time.monotonic() > deadline:
+            return False, False
+        time.sleep(0.05)
+
+
+def _end_turn(probing: bool):
+    if probing:
+        _probe_lock.release()
+
+
+def _acquire_slot(req_id, deadline=None) -> bool:
+    """Take one of the max_concurrent_upstream slots. True if we hold it."""
+    if _upstream_slots is None:
+        return True
+    timeout = None
+    if deadline is not None:
+        timeout = max(0.0, deadline - time.monotonic())
+        if timeout <= 0:
+            return False
+    if _upstream_slots.acquire(timeout=timeout):
+        return True
+    print(
+        f".. [{req_id}] no upstream slot free within this request's time "
+        f"budget \u2014 not queueing any longer",
+        flush=True,
+    )
+    return False
+
+
+def _release_slot():
+    if _upstream_slots is not None:
+        _upstream_slots.release()
+
+
 def _redact_headers(headers: dict) -> dict:
     return {
         k: ("***redacted***" if k.lower() in REDACT_HEADERS else v)
@@ -439,8 +589,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         _t0 = time.monotonic()
         in_bytes = len(body)
         max_attempts = RETRY_MAX_ATTEMPTS if RETRY_ENABLED else 1
+        deadline = _t0 + MAX_TOTAL_RETRY_SECONDS if MAX_TOTAL_RETRY_SECONDS > 0 else None
+        last_pause = RETRY_PAUSE_SECONDS
 
         for attempt in range(1, max_attempts + 1):
+            # Another thread may have just been told to slow down. Honour
+            # that before adding one more request to the pile.
+            turn_ok, probing = _await_turn(req_id, deadline)
+            if not turn_ok:
+                self._write_masked_retry(
+                    req_id, "shared cooldown longer than this request's budget",
+                    retry_after=_gate_remaining(),
+                )
+                return
+            if not _acquire_slot(req_id, deadline):
+                _end_turn(probing)
+                self._write_masked_retry(
+                    req_id, "upstream concurrency limit", retry_after=last_pause)
+                return
+
             # Fresh Request object per attempt — cheap, and avoids any risk
             # of urllib mutating headers on a reused one across retries.
             req = urllib.request.Request(url, data=body or None, headers=upstream_headers, method=method)
@@ -451,12 +618,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                             req_id, resp.status, resp.getheaders(), resp, method)
                     else:
                         usage, out_bytes = self._relay(req_id, resp.status, resp.getheaders(), resp)
+                # Something got through, so whatever limit was in force has
+                # lifted — let anyone still queued behind the gate move.
+                _gate_clear()
                 _print_stats(req_id, usage, time.monotonic() - _t0, in_bytes, out_bytes)
                 return
             except _ClientGone:
                 return
             except _InvalidUpstreamBody as e:
                 retrying = RETRY_ENABLED and e.retryable and attempt < max_attempts
+                if retrying and deadline is not None and \
+                        time.monotonic() + BODY_RETRY_PAUSE_SECONDS > deadline:
+                    retrying = False
 
                 write_log({
                     "type": "response",
@@ -496,8 +669,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
                 pause = pause_source = None
                 if retrying:
-                    pause, pause_source = _resolve_pause(headers, err_body, RETRY_PAUSE_SECONDS)
-                    if pause > RETRY_MAX_PAUSE_SECONDS:
+                    # The fallback grows across attempts; an explicit
+                    # Retry-After / body hint is always honoured as given.
+                    fallback = min(
+                        RETRY_PAUSE_SECONDS * (RETRY_BACKOFF_FACTOR ** (attempt - 1)),
+                        RETRY_MAX_PAUSE_SECONDS,
+                    )
+                    pause, pause_source = _resolve_pause(headers, err_body, fallback)
+                    last_pause = pause
+                    if deadline is not None and time.monotonic() + pause > deadline:
+                        print(
+                            f".. [{req_id}] {pause:.1f}s wait would push this "
+                            f"request past its {MAX_TOTAL_RETRY_SECONDS:.0f}s "
+                            f"budget \u2014 not retrying",
+                            flush=True,
+                        )
+                        retrying = False
+                    elif pause > RETRY_MAX_PAUSE_SECONDS:
                         # A wait this long looks like a daily/monthly quota
                         # reset, not a transient hiccup — waiting would just
                         # hold Kilo's connection open for no good reason.
@@ -526,12 +714,20 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         f"({pause_source}) (not sent to Kilo)",
                         flush=True,
                     )
-                    time.sleep(pause)
+                    # Publish the wait instead of sleeping it privately, so
+                    # the other in-flight requests sit it out as well —
+                    # _gate_wait at the top of the loop does the sleeping.
+                    _gate_penalize(pause)
                     continue
 
                 _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, len(err_body))
 
                 if RETRY_ENABLED and code_is_retryable:
+                    # Giving up here means the client will come back, so the
+                    # number we hand it has to be one we'd honour ourselves:
+                    # arm the gate for the same span rather than letting the
+                    # next request walk straight back into the limit.
+                    _gate_penalize(last_pause)
                     # Silent-retry budget is used up (or the resolved wait
                     # looked like a quota reset). Kilo never sees the real
                     # status or body here — upstreams shove this family of
@@ -540,7 +736,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # copes with a plain 429 + Retry-After far better than
                     # with whichever shape happened to come back last. The
                     # real status/body is still in the log above.
-                    self._write_masked_retry(req_id, e.code)
+                    self._write_masked_retry(req_id, e.code, retry_after=last_pause)
                 else:
                     self._write_final(req_id, e.code, headers, err_body, "error_forward")
                 return
@@ -550,18 +746,29 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, 0)
                 self._write_final(req_id, 502, [], str(e).encode(), "network_error")
                 return
+            finally:
+                # Runs on the retry `continue` too, so a waiting request
+                # gets the slot instead of it being pinned for the pause.
+                _release_slot()
+                _end_turn(probing)
 
-    def _write_masked_retry(self, req_id, original):
+    def _write_masked_retry(self, req_id, original, retry_after=None):
         """Send Kilo one predictable shape after we give up retrying.
 
         `original` is whatever actually went wrong — an upstream status
         code (500, 502, 529, ...) or a body-validation reason. It is
-        logged, but never forwarded. Kilo only ever sees a
-        plain 429 with a Retry-After header pulled straight from config
-        ([retry] pause_seconds), so it backs off the same way regardless
-        of which unfamiliar error shape the upstream used underneath.
+        logged, but never forwarded. Kilo only ever sees a plain 429 with
+        a Retry-After header, so it backs off the same way regardless of
+        which unfamiliar error shape the upstream used underneath.
+
+        The number sent is the largest of: what the upstream last asked
+        for, what the shared cooldown still has to run, and the configured
+        pause_seconds. Sending a flat config value instead would send the
+        client back before the limit it just hit has cleared.
         """
-        retry_after = int(round(RETRY_PAUSE_SECONDS))
+        if retry_after is None:
+            retry_after = RETRY_PAUSE_SECONDS
+        retry_after = int(round(max(1.0, retry_after, _gate_remaining(), RETRY_PAUSE_SECONDS)))
         body = json.dumps({
             "error": {
                 "message": f"Upstream temporarily unavailable (was {original}). Retry after {retry_after}s.",
