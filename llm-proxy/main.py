@@ -46,6 +46,20 @@ HOST = CONFIG["server"]["host"]
 PORT = CONFIG["server"]["port"]
 NVIDIA_HOST = CONFIG["upstream"]["host"]
 UPSTREAM_TIMEOUT_SEC = CONFIG["upstream"].get("timeout_sec", 120)
+# Hard ceiling on the TOTAL time one response body may take to arrive
+# when the upstream keeps trickling data (even a byte at a time)
+# without ever going idle for longer than timeout_sec on its own. A
+# single fp.read() stalling past timeout_sec is normally treated as a
+# dead connection and fails the request — but if the upstream has
+# already sent at least one byte for this response, that one stall is
+# tolerated and the read is retried in place instead, as long as the
+# total time spent on this response hasn't yet passed
+# stream_max_wait_sec. This does NOT remove the timeout: an upstream
+# that trickles forever still eventually gets cut off here, it's just
+# given more patience than a single timeout_sec. A completely silent
+# upstream (never sends a byte) is unaffected and still fails at the
+# plain timeout_sec as before.
+STREAM_MAX_WAIT_SEC = CONFIG["upstream"].get("stream_max_wait_sec", 900)
 
 LOG_ENABLED = CONFIG["logging"]["enabled"]
 LOG_DIR = CONFIG["logging"]["log_dir"]
@@ -549,6 +563,35 @@ def _validate_body(content_type: str, raw: bytes, status: int = 200,
         return False, "invalid JSON body"
 
 
+def _tolerant_read(fp, amt, stream_start, has_data, req_id):
+    """One fp.read(amt), retried in place across benign idle stalls.
+
+    A read timing out (TimeoutError — what a stalled socket raises,
+    whether it surfaces as the http.client/urllib built-in or its
+    socket.timeout alias) only keeps this loop spinning when both:
+      - has_data() is true, i.e. the upstream has already sent at
+        least one byte for this response, so it's known to be alive
+        rather than dead; and
+      - less than STREAM_MAX_WAIT_SEC has passed since stream_start.
+
+    Otherwise the TimeoutError is re-raised and handled exactly as
+    before this feature existed. See STREAM_MAX_WAIT_SEC above for why
+    this is a widened budget, not a removed timeout.
+    """
+    while True:
+        try:
+            return fp.read(amt)
+        except TimeoutError:
+            if not has_data() or time.monotonic() - stream_start >= STREAM_MAX_WAIT_SEC:
+                raise
+            print(
+                f".. [{req_id}] upstream idle past timeout_sec ({UPSTREAM_TIMEOUT_SEC}s) "
+                f"but has sent data before for this response \u2014 still inside the "
+                f"stream_max_wait_sec budget ({STREAM_MAX_WAIT_SEC}s), continuing to wait",
+                flush=True,
+            )
+
+
 def write_log(entry: dict):
     if not LOG_ENABLED:
         return
@@ -856,12 +899,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             content_type = _get_ci(headers, "Content-Type")
             captured = bytearray()
             total_len = 0
+            stream_start = time.monotonic()
 
             # Stream to the client in real time; separately buffer (up to
             # the configured cap) a copy for the log entry written after
             # the loop. total_len tracks the FULL size regardless of cap.
             while True:
-                chunk = fp.read(4096)
+                chunk = _tolerant_read(
+                    fp, 4096, stream_start, lambda: total_len > 0, req_id)
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -911,9 +956,11 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         captured = bytearray()
         over_limit = False
+        stream_start = time.monotonic()
         try:
             while True:
-                chunk = fp.read(65536)
+                chunk = _tolerant_read(
+                    fp, 65536, stream_start, lambda: len(captured) > 0, req_id)
                 if not chunk:
                     break
                 captured.extend(chunk)

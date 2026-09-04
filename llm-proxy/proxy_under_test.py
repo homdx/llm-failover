@@ -99,23 +99,38 @@ def make_handler(proxy, real_headers=False):
 class FakeUpstream:
     """Mimics http.client.HTTPResponse closely enough for the relay paths.
 
-    chunks are returned one per read(); raise_at_end is raised once the
-    chunks run out, which is how a body that stops arriving part-way
-    through actually presents itself.
+    chunks are returned one per read(). A chunk that is itself an
+    exception *instance* is raised (not returned) when its turn comes,
+    which is how an idle stall in the middle of an otherwise-live
+    stream is simulated — interleave BaseException instances with byte
+    chunks to model "timed out, then more data, then timed out again".
+    raise_at_end is raised once every chunk has been consumed, which is
+    how a body that stops arriving part-way through actually presents
+    itself. clock, if given, is called (no args) on every read() —
+    tests use it to advance a fake time.monotonic() deterministically
+    instead of actually sleeping.
     """
 
-    def __init__(self, status, headers, chunks, raise_at_end=None):
+    def __init__(self, status, headers, chunks, raise_at_end=None, clock=None):
         self.status = status
         self._headers = headers
         self._chunks = list(chunks)
         self._raise = raise_at_end
+        self._clock = clock
+        self.read_calls = 0
 
     def getheaders(self):
         return self._headers
 
     def read(self, amt=None):
+        self.read_calls += 1
+        if self._clock is not None:
+            self._clock()
         if self._chunks:
-            return self._chunks.pop(0)
+            item = self._chunks.pop(0)
+            if isinstance(item, BaseException):
+                raise item
+            return item
         if self._raise is not None:
             exc, self._raise = self._raise, None
             raise exc

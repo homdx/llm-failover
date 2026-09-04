@@ -5,6 +5,15 @@ port = 8080
 [upstream]
 host = "openai.example.ai"
 timeout_sec = 120   # per-attempt urlopen timeout to NVIDIA
+# If the upstream has already sent at least one byte for a response but
+# then goes idle for longer than timeout_sec, that single stall is
+# tolerated instead of failing the request, and the read is retried in
+# place — as long as the TOTAL time spent on that response stays under
+# stream_max_wait_sec. A completely silent upstream (never sends a
+# byte) is unaffected and still fails at the plain timeout_sec above.
+# This does not remove the timeout, it only widens it while data is
+# still trickling in. 900 = 15 minutes.
+stream_max_wait_sec = 900
 
 [proxy]
 # Leave false if you're launching this with `proxychains4 python3 main.py`.
