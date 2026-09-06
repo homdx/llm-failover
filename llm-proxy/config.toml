@@ -4,7 +4,11 @@ port = 8080
 
 [upstream]
 host = "openai.example.ai"
-timeout_sec = 120   # per-attempt urlopen timeout to NVIDIA
+scheme = "https"
+#for ollama scheme = "http"
+#for ollama host = "localhost:11434"
+#timeout 1 hour for ollama 3600
+timeout_sec = 239   # per-attempt urlopen timeout to NVIDIA
 # If the upstream has already sent at least one byte for a response but
 # then goes idle for longer than timeout_sec, that single stall is
 # tolerated instead of failing the request, and the read is retried in
@@ -14,6 +18,20 @@ timeout_sec = 120   # per-attempt urlopen timeout to NVIDIA
 # This does not remove the timeout, it only widens it while data is
 # still trickling in. 900 = 15 minutes.
 stream_max_wait_sec = 900
+# How long the upstream may stay completely silent before the proxy starts
+# holding the CLIENT's connection open on its own, by committing to a 200
+# text/event-stream and dripping ignorable ": keepalive" SSE comments until
+# the real response arrives. This is what defeats the client-side 5-minute
+# cutoff (undici's default headersTimeout) while a cold model loads.
+# Only ever applied to requests that asked for "stream": true.
+# Trade-off: the status code is spent early, so once the drip has started a
+# masked 429 / upstream error is delivered as an error chunk inside the
+# stream instead of as a status. Keep this ABOVE a normal error round-trip
+# so ordinary 4xx/5xx still come back as real statuses, and BELOW the
+# client's own timeout. 0 = off, exactly the old behaviour.
+heartbeat_after_sec = 240
+# Gap between keepalive comments once the drip has started.
+heartbeat_interval_sec = 20
 
 [proxy]
 # Leave false if you're launching this with `proxychains4 python3 main.py`.
@@ -40,13 +58,14 @@ max_attempts = 10       # total tries, including the first — so 2 retries here
 # Retry-After header, or a "try again in Xms" / "retry in Xs" hint in the
 # error body, that number is used instead — pause_seconds only applies
 # when neither is present. 500/502/529 almost never carry a Retry-After
-# header or a body hint, so in practice this 30s fallback IS the wait for
+# header or a body hint, so in practice this fallback IS the wait for
 # those three.
 pause_seconds = 15
 # A resolved wait longer than this (header or body hint) is treated as a
 # quota reset rather than a transient limit — the error is forwarded to
 # Kilo immediately instead of holding its connection open that long.
 max_pause_seconds = 180
+#for ollama 1800
 # Buffer the WHOLE upstream response and check it's structurally intact
 # before sending anything to Kilo. This is what makes a real silent
 # retry possible on a body that's corrupted or truncated MID-stream (a
@@ -55,6 +74,7 @@ max_pause_seconds = 180
 # plain 200. Trade-off: Kilo no longer gets live token-by-token output,
 # it gets the whole response at once, after upstream finishes.
 validate_response_body = true
+# for ollama validate_response_body = false
 # Memory safety valve — once a response grows past this, it stops being
 # buffered and is streamed straight through to the client instead, with
 # no body validation (there is nothing left to validate against). It is
@@ -98,6 +118,7 @@ max_concurrent_upstream = 2
 # written to a socket nobody is reading. Kilo handles a 429 + Retry-After
 # perfectly well, so handing control back early is the better trade.
 max_total_retry_seconds = 45
+#for ollama 0
 # Random spread applied when queued requests come off a shared cooldown,
 # so they don't all fire on the same instant and re-trigger the limit.
 cooldown_jitter_seconds = 0.5
