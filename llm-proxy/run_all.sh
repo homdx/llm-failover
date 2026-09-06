@@ -6,6 +6,12 @@
 # The folder must hold the proxy script (main.py or python_proxy2.py) and
 # its config.toml. Nothing touches the network; every upstream is faked
 # in-process. Exit status is 0 only if all of them pass.
+#
+# test_python_proxy.py is deliberately NOT in this list: it is a unittest
+# suite that takes no folder argument and is run from inside the proxy
+# folder instead —
+#
+#     python3 -m unittest test_python_proxy
 set -e
 
 if [ -z "$1" ]; then
@@ -17,7 +23,7 @@ TARGET=$(cd "$1" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
 FAILED=0
 
-for t in test_truncation test_false_positives test_coordination test_aborted_response; do
+for t in test_truncation test_false_positives test_coordination test_aborted_response test_stream_stall_patience test_heartbeat; do
     echo
     echo "=============================================================="
     echo "  $t"
