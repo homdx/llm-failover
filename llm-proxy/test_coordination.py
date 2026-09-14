@@ -44,7 +44,7 @@ FakeHandler = put.make_handler(main)
 
 def drive(n_clients, responder):
     if PATCHED:
-        main._gate_clear()
+        main._gate_clear(main._get_host_state(main.NVIDIA_HOST))
     urllib.request.urlopen = responder
     main.urllib.request.urlopen = responder
     handlers = [FakeHandler() for _ in range(n_clients)]
@@ -106,8 +106,9 @@ report("upstream recovers after 4 rejections",
 
 # 2b. that success must leave no cooldown armed behind it
 if PATCHED:
-    report("gate cleared after a success", main._gate_remaining() == 0,
-           f"remaining={main._gate_remaining():.2f}s")
+    _default_state = main._get_host_state(main.NVIDIA_HOST)
+    report("gate cleared after a success", main._gate_remaining(_default_state) == 0,
+           f"remaining={main._gate_remaining(_default_state):.2f}s")
 
 # 3. Retry-After handed to the client must not undercut what upstream asked
 def slow_limit(req, timeout=None):

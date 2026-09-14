@@ -29,6 +29,7 @@ The proxy is imported under whichever name it has in that folder —
 | `test_stream_stall_patience.py` | An upstream that trickles — does one slow byte keep the request alive, does a trickle that never ends still hit the `stream_max_wait_sec` ceiling, and does a completely dead upstream still fail on the first read? |
 | `test_heartbeat.py` | The client-side keepalive: is it off when `heartbeat_after_sec = 0`, off on non-stream requests, off when the upstream answers in time, and when it does fire does it emit exactly one status line, keep every keepalive out of a real chunk, and still deliver a late error as an in-stream chunk? |
 | `test_aborted_response.py` | Once bytes have gone to the client, does an upstream failure stop rather than retry? A retry there is undeliverable, re-bills the completion, and splices a second status line into the body. |
+| `test_key_routing.py` | Sqlite-backed per-key upstream routing (`key_store.py`): is it a true no-op with no db file present, does a matching key route to that entry's host, does a missing key fall back to `[upstream]` *and* say so on the console, and is `max_concurrent_upstream`/the retry gate tracked per host instead of pooled across all of them? |
 | `bench_ratelimit_storm.py` | Measurement, not pass/fail: five parallel requests against an upstream that answers 429 every time — how many requests does the proxy actually send, and for how long does it hold the client? |
 
 ## The keepalive settings these tests cover

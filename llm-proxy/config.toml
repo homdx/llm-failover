@@ -33,6 +33,21 @@ heartbeat_after_sec = 240
 # Gap between keepalive comments once the drip has started.
 heartbeat_interval_sec = 20
 
+[keys]
+# Optional: transparent per-key upstream routing via the api_manager.py
+# sqlite store (api_manager.py add/list/get/update/rm). When the client's
+# api key (Authorization: Bearer ..., api-key, or x-api-key header) matches
+# an entry's api_key column, THAT entry's host/scheme are used for this
+# request instead of [upstream].host/scheme above — every other setting in
+# this file (timeouts, retry, logging, ...) still applies unchanged, and
+# max_concurrent_upstream/the retry cooldown are tracked per host rather
+# than pooled, so one key's rate limit can't block another key's host.
+# Leave unset to use api_manager's own default
+# ($API_MANAGER_DB or ~/.config/api-manager/entries.db). No db file at
+# this path, or a request whose key isn't in it, is not an error: the
+# proxy logs it to the console and falls back to [upstream] above.
+#db_path = "/home/you/.config/api-manager/entries.db"
+
 [proxy]
 # Leave false if you're launching this with `proxychains4 python3 main.py`.
 # Set true (and fill in the two fields below) only if you want the script

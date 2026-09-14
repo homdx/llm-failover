@@ -471,7 +471,7 @@ class HttpErrorRetryTest(unittest.TestCase):
         # the test doesn't really sleep out a 42s cooldown between the
         # two attempts.
         mod = load_proxy(max_attempts=2)
-        mod._gate_penalize = lambda seconds: None
+        mod._gate_penalize = lambda state, seconds: None
         upstream = ScriptedUpstream([make_http_error(429, headers={"Retry-After": "42"})])
         mod.urllib.request.urlopen = upstream
 
@@ -624,7 +624,7 @@ class ConcurrencyLimitTest(unittest.TestCase):
     def test_backoff_factor_grows_the_published_pause_across_attempts(self):
         mod = load_proxy(pause_seconds=10, backoff_factor=2.0, max_pause_seconds=1000, max_attempts=4)
         recorded = []
-        mod._gate_penalize = lambda seconds: recorded.append(seconds)  # don't actually arm the gate
+        mod._gate_penalize = lambda state, seconds: recorded.append(seconds)  # don't actually arm the gate
         mod.urllib.request.urlopen = ScriptedUpstream([make_http_error(502)])
 
         h = make_handler(mod)
@@ -650,6 +650,10 @@ class SocksStartupTest(unittest.TestCase):
                     "[retry]\nenabled = false\n"
                 )
             shutil.copy(PROXY_SCRIPT_PATH, os.path.join(tmpdir, "proxy_script.py"))
+            shutil.copy(
+                os.path.join(os.path.dirname(PROXY_SCRIPT_PATH), "key_store.py"),
+                os.path.join(tmpdir, "key_store.py"),
+            )
 
             script = (
                 "import builtins, runpy\n"

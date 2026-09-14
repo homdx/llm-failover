@@ -37,6 +37,8 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib  # pip install tomli   (Python < 3.11)
 
+import key_store
+
 CONFIG_PATH = "config.toml"
 
 with open(CONFIG_PATH, "rb") as f:
@@ -49,6 +51,17 @@ NVIDIA_HOST = CONFIG["upstream"]["host"]
 # config.toml when pointing upstream.host at a plain local server such as
 # Ollama (e.g. localhost:11434), which doesn't speak TLS.
 UPSTREAM_SCHEME = CONFIG["upstream"].get("scheme", "https")
+
+# --- transparent per-key upstream routing via the api_manager sqlite store ---
+# Optional [keys] section in config.toml; .get(...) so an existing
+# config.toml without it still works and this is a no-op. When the
+# client's api key (Authorization: Bearer ..., api-key, or x-api-key
+# header) matches a row in that database, its host/scheme are used for
+# this request INSTEAD of upstream.host/scheme above. No DB file, no
+# match, or a DB that fails to open all fall back to upstream.host/scheme
+# unchanged — the feature is entirely additive.
+_KEYS_CFG = CONFIG.get("keys", {})
+KEY_STORE_DB_PATH = key_store.resolve_db_path(_KEYS_CFG.get("db_path"))
 UPSTREAM_TIMEOUT_SEC = CONFIG["upstream"].get("timeout_sec", 120)
 # Hard ceiling on the TOTAL time one response body may take to arrive
 # when the upstream keeps trickling data (even a byte at a time)
@@ -494,51 +507,77 @@ def _resolve_pause(headers, err_body: bytes, default_seconds: float):
 # the limit never gets a chance to clear. One deadline, set by whoever hit
 # the limit most recently, respected by everyone before their next attempt.
 # ---------------------------------------------------------------------------
-_gate_lock = threading.Lock()
-_gate_until = 0.0  # time.monotonic() deadline; no upstream call before this
-# Held by the one request allowed to test the upstream when a cooldown
-# lifts. Without it, every queued thread fires the instant the deadline
-# passes and the limit is hit N times over to learn one fact.
-_probe_lock = threading.Lock()
-_upstream_slots = (
-    threading.BoundedSemaphore(MAX_CONCURRENT_UPSTREAM)
-    if MAX_CONCURRENT_UPSTREAM > 0 else None
-)
+# A rate limit belongs to the account behind a given upstream HOST, not to
+# one request or to the proxy as a whole \u2014 so with per-key routing (see
+# key_store.py) each host gets its OWN gate and its OWN semaphore, sized
+# from the same config.toml [retry] values, rather than one pool shared
+# across every host the proxy happens to talk to. Pooling them would let a
+# cooldown on host A block traffic to unrelated host B, and would let
+# host B's requests eat into slots meant for host A's max_concurrent_upstream.
+class _HostState:
+    __slots__ = ("gate_lock", "gate_until", "probe_lock", "slots")
+
+    def __init__(self):
+        self.gate_lock = threading.Lock()
+        self.gate_until = 0.0  # time.monotonic() deadline; no upstream call before this
+        # Held by the one request allowed to test this host's upstream when
+        # its cooldown lifts. Without it, every queued thread fires the
+        # instant the deadline passes and the limit is hit N times over to
+        # learn one fact.
+        self.probe_lock = threading.Lock()
+        self.slots = (
+            threading.BoundedSemaphore(MAX_CONCURRENT_UPSTREAM)
+            if MAX_CONCURRENT_UPSTREAM > 0 else None
+        )
 
 
-def _gate_penalize(seconds: float):
-    """Stand every thread down for `seconds`. Never shortens an existing wait."""
-    global _gate_until
+_host_states_lock = threading.Lock()
+_host_states = {}  # host -> _HostState, created lazily as hosts are seen
+
+
+def _get_host_state(host):
+    with _host_states_lock:
+        state = _host_states.get(host)
+        if state is None:
+            state = _HostState()
+            _host_states[host] = state
+        return state
+
+
+def _gate_penalize(state, seconds: float):
+    """Stand every thread bound for this host down for `seconds`.
+
+    Never shortens an existing wait.
+    """
     if seconds <= 0:
         return
     deadline = time.monotonic() + seconds
-    with _gate_lock:
-        if deadline > _gate_until:
-            _gate_until = deadline
+    with state.gate_lock:
+        if deadline > state.gate_until:
+            state.gate_until = deadline
 
 
-def _gate_remaining() -> float:
-    with _gate_lock:
-        return max(0.0, _gate_until - time.monotonic())
+def _gate_remaining(state) -> float:
+    with state.gate_lock:
+        return max(0.0, state.gate_until - time.monotonic())
 
 
-def _gate_clear():
-    """A request got through, so the limit isn't in force any more.
+def _gate_clear(state):
+    """A request got through, so this host's limit isn't in force any more.
 
     If that read was wrong the very next 429 re-arms the gate, which costs
-    one wasted request — cheaper than making everyone sit out a cooldown
+    one wasted request \u2014 cheaper than making everyone sit out a cooldown
     that has already expired.
     """
-    global _gate_until
-    with _gate_lock:
-        _gate_until = 0.0
+    with state.gate_lock:
+        state.gate_until = 0.0
 
 
-def _await_turn(req_id, deadline=None):
-    """Wait for the shared cooldown, then for permission to go upstream.
+def _await_turn(state, req_id, deadline=None):
+    """Wait for this host's shared cooldown, then for permission to go upstream.
 
     Returns (ok, probing). ok is False when waiting any longer would blow
-    this request's time budget — the caller answers the client instead.
+    this request's time budget \u2014 the caller answers the client instead.
 
     While no cooldown is in force this returns immediately and requests
     run in parallel as before. Coming OUT of a cooldown is the part that
@@ -550,7 +589,7 @@ def _await_turn(req_id, deadline=None):
     """
     waited = False
     while True:
-        remaining = _gate_remaining()
+        remaining = _gate_remaining(state)
         if remaining > 0:
             if deadline is not None and time.monotonic() + remaining > deadline:
                 return False, False
@@ -567,10 +606,10 @@ def _await_turn(req_id, deadline=None):
         if not waited:
             return True, False
 
-        if _probe_lock.acquire(blocking=False):
-            if _gate_remaining() > 0:
+        if state.probe_lock.acquire(blocking=False):
+            if _gate_remaining(state) > 0:
                 # Re-armed by another thread between the two checks.
-                _probe_lock.release()
+                state.probe_lock.release()
                 continue
             if COOLDOWN_JITTER_SECONDS:
                 time.sleep(random.uniform(0.0, COOLDOWN_JITTER_SECONDS))
@@ -583,21 +622,21 @@ def _await_turn(req_id, deadline=None):
         time.sleep(0.05)
 
 
-def _end_turn(probing: bool):
+def _end_turn(state, probing: bool):
     if probing:
-        _probe_lock.release()
+        state.probe_lock.release()
 
 
-def _acquire_slot(req_id, deadline=None) -> bool:
-    """Take one of the max_concurrent_upstream slots. True if we hold it."""
-    if _upstream_slots is None:
+def _acquire_slot(state, req_id, deadline=None) -> bool:
+    """Take one of this host's max_concurrent_upstream slots. True if held."""
+    if state.slots is None:
         return True
     timeout = None
     if deadline is not None:
         timeout = max(0.0, deadline - time.monotonic())
         if timeout <= 0:
             return False
-    if _upstream_slots.acquire(timeout=timeout):
+    if state.slots.acquire(timeout=timeout):
         return True
     print(
         f".. [{req_id}] no upstream slot free within this request's time "
@@ -607,9 +646,9 @@ def _acquire_slot(req_id, deadline=None) -> bool:
     return False
 
 
-def _release_slot():
-    if _upstream_slots is not None:
-        _upstream_slots.release()
+def _release_slot(state):
+    if state.slots is not None:
+        state.slots.release()
 
 
 def _redact_headers(headers: dict) -> dict:
@@ -617,6 +656,31 @@ def _redact_headers(headers: dict) -> dict:
         k: ("***redacted***" if k.lower() in REDACT_HEADERS else v)
         for k, v in headers.items()
     }
+
+
+def _resolve_upstream(req_id, headers):
+    """Return (host, scheme) for this request.
+
+    Transparent by construction: with no [keys].db_path configured and no
+    file at the default location, this returns the config.toml default on
+    every request without even trying to touch sqlite. Only when that file
+    exists do we bother parsing an api key out of the request and looking
+    it up — a miss there (key missing, or not in the db) falls back to the
+    same default and prints why, so a bad/rotated key doesn't fail silently.
+    """
+    if not key_store.db_available(KEY_STORE_DB_PATH):
+        return NVIDIA_HOST, UPSTREAM_SCHEME
+    api_key = key_store.extract_api_key(headers)
+    entry = key_store.lookup(api_key, KEY_STORE_DB_PATH) if api_key else None
+    if entry is not None:
+        return entry.host, entry.scheme
+    print(
+        f".. [{req_id}] api key not found in {KEY_STORE_DB_PATH} — "
+        f"falling back to default upstream {UPSTREAM_SCHEME}://{NVIDIA_HOST} "
+        f"from config.toml",
+        flush=True,
+    )
+    return NVIDIA_HOST, UPSTREAM_SCHEME
 
 
 def _parse_body(raw: bytes, content_type: str):
@@ -812,14 +876,17 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "body": _parse_body(body, self.headers.get("Content-Type", "")),
         })
 
+        upstream_host, upstream_scheme = _resolve_upstream(req_id, self.headers)
+        host_state = _get_host_state(upstream_host)
+
         upstream_headers = {
             k: v for k, v in self.headers.items()
             if k.lower() not in STRIP_REQUEST_HEADERS
         }
-        upstream_headers["Host"] = NVIDIA_HOST
+        upstream_headers["Host"] = upstream_host
         upstream_headers["Accept-Encoding"] = "identity"
 
-        url = f"{UPSTREAM_SCHEME}://{NVIDIA_HOST}{self.path}"
+        url = f"{upstream_scheme}://{upstream_host}{self.path}"
 
         _t0 = time.monotonic()
         in_bytes = len(body)
@@ -845,24 +912,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             # Another thread may have just been told to slow down. Honour
             # that before adding one more request to the pile.
             t_wait = time.monotonic()
-            turn_ok, probing = _await_turn(req_id, deadline)
+            turn_ok, probing = _await_turn(host_state, req_id, deadline)
             trace.wait_sec += time.monotonic() - t_wait
             if not turn_ok:
                 _print_stats(req_id, None, trace, in_bytes, 0, outcome="429")
                 self._write_masked_retry(
                     req_id, "shared cooldown longer than this request's budget",
-                    retry_after=_gate_remaining(), trace=trace,
+                    retry_after=_gate_remaining(host_state), trace=trace,
+                    host_state=host_state,
                 )
                 return
             t_wait = time.monotonic()
-            slot_ok = _acquire_slot(req_id, deadline)
+            slot_ok = _acquire_slot(host_state, req_id, deadline)
             trace.wait_sec += time.monotonic() - t_wait
             if not slot_ok:
-                _end_turn(probing)
+                _end_turn(host_state, probing)
                 _print_stats(req_id, None, trace, in_bytes, 0, outcome="429")
                 self._write_masked_retry(
                     req_id, "upstream concurrency limit", retry_after=last_pause,
-                    trace=trace)
+                    trace=trace, host_state=host_state)
                 return
 
             # Fresh Request object per attempt — cheap, and avoids any risk
@@ -893,7 +961,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     stop_heartbeat and stop_heartbeat()
                 # Something got through, so whatever limit was in force has
                 # lifted — let anyone still queued behind the gate move.
-                _gate_clear()
+                _gate_clear(host_state)
                 _print_stats(req_id, usage, trace, in_bytes, out_bytes, outcome="OK")
                 return
             except _ClientGone:
@@ -937,7 +1005,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 # fixing (Kilo choking on a spliced-in "HTTP/1.1 502 Bad
                 # Gateway" mid-JSON-string) — mask it the same predictable
                 # way as an exhausted status-code retry instead.
-                self._write_masked_retry(req_id, f"malformed body: {e.reason}", trace=trace)
+                self._write_masked_retry(req_id, f"malformed body: {e.reason}", trace=trace,
+                                          host_state=host_state)
                 return
             except urllib.error.HTTPError as e:
                 trace.failures.append(str(e.code))
@@ -996,7 +1065,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # Publish the wait instead of sleeping it privately, so
                     # the other in-flight requests sit it out as well —
                     # _gate_wait at the top of the loop does the sleeping.
-                    _gate_penalize(pause)
+                    _gate_penalize(host_state, pause)
                     continue
 
                 will_mask_as_429 = RETRY_ENABLED and code_is_retryable
@@ -1010,7 +1079,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # number we hand it has to be one we'd honour ourselves:
                     # arm the gate for the same span rather than letting the
                     # next request walk straight back into the limit.
-                    _gate_penalize(last_pause)
+                    _gate_penalize(host_state, last_pause)
                     # Silent-retry budget is used up (or the resolved wait
                     # looked like a quota reset). Kilo never sees the real
                     # status or body here — upstreams shove this family of
@@ -1020,7 +1089,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # with whichever shape happened to come back last. The
                     # real status/body is still in the log above.
                     self._write_masked_retry(req_id, e.code, retry_after=last_pause,
-                                              trace=trace)
+                                              trace=trace, host_state=host_state)
                 else:
                     self._write_final(req_id, e.code, headers, err_body, "error_forward")
                 return
@@ -1033,8 +1102,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             finally:
                 # Runs on the retry `continue` too, so a waiting request
                 # gets the slot instead of it being pinned for the pause.
-                _release_slot()
-                _end_turn(probing)
+                _release_slot(host_state)
+                _end_turn(host_state, probing)
 
     def _start_heartbeat(self, req_id, trace: "_ReqTrace" = None):
         """Begin an SSE keepalive drip; returns a stop() callable.
@@ -1118,7 +1187,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             write_log({"type": "client_disconnected", "id": req_id, "stage": stage})
             return False
 
-    def _write_masked_retry(self, req_id, original, retry_after=None, trace: "_ReqTrace" = None):
+    def _write_masked_retry(self, req_id, original, retry_after=None, trace: "_ReqTrace" = None,
+                             host_state=None):
         """Send Kilo one predictable shape after we give up retrying.
 
         `original` is whatever actually went wrong — an upstream status
@@ -1143,7 +1213,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         """
         if retry_after is None:
             retry_after = RETRY_PAUSE_SECONDS
-        retry_after = int(round(max(1.0, retry_after, _gate_remaining(), RETRY_PAUSE_SECONDS)))
+        gate_remaining = _gate_remaining(host_state) if host_state is not None else 0.0
+        retry_after = int(round(max(1.0, retry_after, gate_remaining, RETRY_PAUSE_SECONDS)))
         body = json.dumps({
             "error": {
                 "message": f"Upstream temporarily unavailable (was {original}). Retry after {retry_after}s.",

@@ -23,7 +23,7 @@ TARGET=$(cd "$1" && pwd)
 HERE=$(cd "$(dirname "$0")" && pwd)
 FAILED=0
 
-for t in test_truncation test_false_positives test_coordination test_aborted_response test_stream_stall_patience test_heartbeat; do
+for t in test_truncation test_false_positives test_coordination test_aborted_response test_stream_stall_patience test_heartbeat test_key_routing; do
     echo
     echo "=============================================================="
     echo "  $t"

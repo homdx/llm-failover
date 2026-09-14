@@ -47,7 +47,7 @@ def rate_limited(req, timeout=None):
 def run(n_clients=5):
     hits.clear()
     if hasattr(main, "_gate_clear"):
-        main._gate_clear()
+        main._gate_clear(main._get_host_state(main.NVIDIA_HOST))
     urllib.request.urlopen = rate_limited
     main.urllib.request.urlopen = rate_limited
 
