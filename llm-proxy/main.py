@@ -673,11 +673,16 @@ def _resolve_upstream(req_id, headers):
     api_key = key_store.extract_api_key(headers)
     entry = key_store.lookup(api_key, KEY_STORE_DB_PATH) if api_key else None
     if entry is not None:
+        print(
+            f".. [{req_id}] api key {key_store.mask_key(api_key)} matched "
+            f"'{entry.name}' — routing to {entry.scheme}://{entry.host}",
+            flush=True,
+        )
         return entry.host, entry.scheme
     print(
-        f".. [{req_id}] api key not found in {KEY_STORE_DB_PATH} — "
-        f"falling back to default upstream {UPSTREAM_SCHEME}://{NVIDIA_HOST} "
-        f"from config.toml",
+        f".. [{req_id}] api key not found in {KEY_STORE_DB_PATH} "
+        f"(saw {key_store.mask_key(api_key)}) — falling back to default "
+        f"upstream {UPSTREAM_SCHEME}://{NVIDIA_HOST} from config.toml",
         flush=True,
     )
     return NVIDIA_HOST, UPSTREAM_SCHEME

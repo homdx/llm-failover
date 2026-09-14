@@ -70,6 +70,15 @@ def extract_api_key(headers) -> str | None:
     return None
 
 
+def mask_key(api_key: str | None) -> str:
+    """Shorten a key for logging without ever printing it in full."""
+    if not api_key:
+        return "<none>"
+    if len(api_key) <= 8:
+        return "*" * len(api_key)
+    return f"{api_key[:6]}...{api_key[-4:]}"
+
+
 def lookup(api_key: str, db_path: Path) -> UpstreamEntry | None:
     """Look an api_key up in the sqlite store.
 
