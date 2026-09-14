@@ -236,7 +236,17 @@ _UPSTREAM_READ_ERRORS = (
 
 # Console-only running totals — never written to logs/*.jsonl.
 _stats_lock = threading.Lock()
-_stats = {"requests": 0, "in_tokens": 0, "out_tokens": 0, "in_bytes": 0, "out_bytes": 0}
+_stats = {
+    "requests": 0, "in_tokens": 0, "out_tokens": 0, "in_bytes": 0, "out_bytes": 0,
+    "ok": 0,
+    # A request that hit >=1 retryable failure and STILL came back OK is a
+    # 429 (or whatever the upstream really said) the client never had to
+    # see — every one of those is a "saved". masked_429 is the opposite:
+    # retry budget ran out and the client got sent home with a 429 anyway.
+    "saved_429": 0,
+    "masked_429": 0,
+    "retries_absorbed": 0,
+}
 
 
 def _human_size(n: int) -> str:
@@ -247,6 +257,85 @@ def _human_size(n: int) -> str:
             return f"{size:.0f}{unit}" if unit == "B" else f"{size:.2f}{unit}"
         size /= 1024.0
     return f"{size:.2f}GB"
+
+
+def _now_str() -> str:
+    """Local wall-clock timestamp for console lines, e.g. '2026-09-12 15:04:22.123'.
+
+    This is deliberately the machine's LOCAL time (not the UTC used in the
+    logs/*.jsonl "ts" field) so it matches whatever clock the person
+    watching the terminal is looking at.
+    """
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Seconds as a short human string: '0.42s', '12.30s', '2m14s', '1h02m03s'.
+
+    Under a minute this is exactly the old "%.2fs" precision. Past a
+    minute — realistic once a few retries and cooldowns stack up — it
+    switches to a Xm/Xh breakdown so nobody has to do the division in
+    their head while reading a live log.
+    """
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{int(m)}m{s:04.1f}s"
+    h, m = divmod(m, 60)
+    return f"{int(h)}h{int(m):02d}m{int(s):02d}s"
+
+
+class _ReqTrace:
+    """Per-request scratchpad shared by the retry loop, the heartbeat
+    thread, and the final _print_stats call — this is what lets the
+    one-line console summary answer not just "how long did this take"
+    but "where did that time actually go" and "did silent retry / the
+    streaming keepalive pay for themselves on this request".
+
+    Thread-safety note: the retry loop is the only writer of attempts /
+    failures / upstream_sec / wait_sec. The heartbeat thread only ever
+    writes heartbeat_committed / heartbeat_committed_at, and only before
+    _stop_heartbeat() has been joined — after that join, the main thread
+    reads it. Simple attribute assignments are already atomic under the
+    GIL, and nothing here is read by one thread while genuinely still
+    being written by another, so no extra lock is needed on top of that.
+    """
+    __slots__ = (
+        "t0", "attempts", "failures", "upstream_sec", "wait_sec",
+        "is_stream", "heartbeat_enabled", "heartbeat_committed",
+        "heartbeat_committed_at", "bridged",
+    )
+
+    def __init__(self, t0, is_stream, heartbeat_enabled):
+        self.t0 = t0
+        self.attempts = 0
+        self.failures = []  # short labels, e.g. ["502", "malformed body"]
+        self.upstream_sec = 0.0
+        self.wait_sec = 0.0
+        self.is_stream = is_stream
+        self.heartbeat_enabled = heartbeat_enabled
+        self.heartbeat_committed = False
+        self.heartbeat_committed_at = None
+        self.bridged = False  # heartbeat fired AND a real response then arrived
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.t0
+
+    def proxy_sec(self) -> float:
+        return max(0.0, self.elapsed() - self.upstream_sec - self.wait_sec)
+
+    def failures_note(self) -> str:
+        return f" failures={self.failures}" if self.failures else ""
+
+    def heartbeat_label(self) -> str:
+        if not self.heartbeat_enabled:
+            return "off"
+        if not self.is_stream:
+            return "n/a"
+        if not self.heartbeat_committed:
+            return "idle"  # eligible, but upstream answered before it fired
+        return "bridged" if self.bridged else "stalled"
 
 
 def _extract_usage(parsed_body):
@@ -268,10 +357,28 @@ def _extract_usage(parsed_body):
     return None
 
 
-def _print_stats(req_id, usage, elapsed, in_bytes, out_bytes):
+def _print_stats(req_id, usage, trace: "_ReqTrace", in_bytes, out_bytes, outcome="OK"):
+    """Print the ONE line that answers, for a request that just reached a
+    FINAL outcome (succeeded, or the retry loop gave up on it): when did
+    this happen, how long did the whole thing take, and where did that
+    time actually go.
+
+    This is the single call site for that line — every terminal branch of
+    _proxy() (success, retries exhausted with a masked 429, a non-retryable
+    error forwarded as-is, a network exception, or giving up before ever
+    reaching the upstream because of a cooldown/concurrency limit) calls
+    this exactly once, so the timestamp and elapsed time are never printed
+    twice for the same request. `outcome` is "OK", "429" when the client
+    ends up being told to back off (regardless of what the upstream really
+    said underneath), or the real HTTP status/exception name otherwise.
+    """
     in_tok  = usage.get("prompt_tokens")     if usage else None
     out_tok = usage.get("completion_tokens") if usage else None
     tot_tok = usage.get("total_tokens")      if usage else None
+
+    elapsed = trace.elapsed()
+    attempts = trace.attempts
+    retries_this_req = max(0, attempts - 1)
 
     with _stats_lock:
         _stats["requests"] += 1
@@ -281,26 +388,47 @@ def _print_stats(req_id, usage, elapsed, in_bytes, out_bytes):
             _stats["out_tokens"] += out_tok
         _stats["in_bytes"]  += in_bytes
         _stats["out_bytes"] += out_bytes
+        _stats["retries_absorbed"] += retries_this_req
+        if outcome == "OK":
+            _stats["ok"] += 1
+            if trace.failures:
+                # Hit at least one retryable failure and still came back
+                # clean — that's a 429 (or whatever it really was) the
+                # client never had to see.
+                _stats["saved_429"] += 1
+        elif outcome == "429":
+            _stats["masked_429"] += 1
         n       = _stats["requests"]
         sum_in  = _stats["in_tokens"]
         sum_out = _stats["out_tokens"]
         sum_in_b  = _stats["in_bytes"]
         sum_out_b = _stats["out_bytes"]
+        snap = dict(_stats)
 
     def _fmt(v):
         return str(v) if v is not None else "?"
 
+    time_note = (
+        f"time={_fmt_duration(elapsed)} "
+        f"(upstream={_fmt_duration(trace.upstream_sec)} "
+        f"wait={_fmt_duration(trace.wait_sec)} "
+        f"proxy={_fmt_duration(trace.proxy_sec())})"
+    )
     print(
-        f"[{req_id}] IN={_fmt(in_tok)} OUT={_fmt(out_tok)} "
-        f"TOTAL={_fmt(tot_tok)} time={elapsed:.2f}s",
+        f"[{req_id}] {_now_str()} outcome={outcome} attempt={attempts} "
+        f"{time_note} heartbeat={trace.heartbeat_label()} "
+        f"IN={_fmt(in_tok)} OUT={_fmt(out_tok)} TOTAL={_fmt(tot_tok)}"
+        f"{trace.failures_note()}",
         flush=True,
     )
     print(
-        f"    \u03a3 requests={n} IN={sum_in} OUT={sum_out} TOTAL={sum_in + sum_out}",
+        f"    \u03a3 requests={n} ok={snap['ok']} masked_429={snap['masked_429']} "
+        f"saved_429={snap['saved_429']} retries_absorbed={snap['retries_absorbed']}",
         flush=True,
     )
     print(
-        f"    \u03a3 size: IN={_human_size(sum_in_b)}  OUT={_human_size(sum_out_b)}  "
+        f"    \u03a3 tokens: IN={sum_in} OUT={sum_out} TOTAL={sum_in + sum_out}  "
+        f"size: IN={_human_size(sum_in_b)} OUT={_human_size(sum_out_b)} "
         f"TOTAL={_human_size(sum_in_b + sum_out_b)}",
         flush=True,
     )
@@ -695,31 +823,53 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
         _t0 = time.monotonic()
         in_bytes = len(body)
-        heartbeat_ok = HEARTBEAT_AFTER_SEC > 0 and _wants_stream(body)
+        is_stream = _wants_stream(body)
+        heartbeat_ok = HEARTBEAT_AFTER_SEC > 0 and is_stream
         max_attempts = RETRY_MAX_ATTEMPTS if RETRY_ENABLED else 1
         deadline = _t0 + MAX_TOTAL_RETRY_SECONDS if MAX_TOTAL_RETRY_SECONDS > 0 else None
         last_pause = RETRY_PAUSE_SECONDS
 
+        # One scratchpad per request, so the final _print_stats line can
+        # report not just "how long" but "attempt N, this much of it spent
+        # actually waiting on a shared limit vs. talking to the upstream".
+        trace = _ReqTrace(_t0, is_stream, HEARTBEAT_AFTER_SEC > 0)
+        print(
+            f">> [{req_id}] {_now_str()} {method} {self.path} "
+            f"in={_human_size(in_bytes)} stream={'yes' if is_stream else 'no'} "
+            f"(up to {max_attempts} attempt{'s' if max_attempts != 1 else ''})",
+            flush=True,
+        )
+
         for attempt in range(1, max_attempts + 1):
+            trace.attempts = attempt
             # Another thread may have just been told to slow down. Honour
             # that before adding one more request to the pile.
+            t_wait = time.monotonic()
             turn_ok, probing = _await_turn(req_id, deadline)
+            trace.wait_sec += time.monotonic() - t_wait
             if not turn_ok:
+                _print_stats(req_id, None, trace, in_bytes, 0, outcome="429")
                 self._write_masked_retry(
                     req_id, "shared cooldown longer than this request's budget",
-                    retry_after=_gate_remaining(),
+                    retry_after=_gate_remaining(), trace=trace,
                 )
                 return
-            if not _acquire_slot(req_id, deadline):
+            t_wait = time.monotonic()
+            slot_ok = _acquire_slot(req_id, deadline)
+            trace.wait_sec += time.monotonic() - t_wait
+            if not slot_ok:
                 _end_turn(probing)
+                _print_stats(req_id, None, trace, in_bytes, 0, outcome="429")
                 self._write_masked_retry(
-                    req_id, "upstream concurrency limit", retry_after=last_pause)
+                    req_id, "upstream concurrency limit", retry_after=last_pause,
+                    trace=trace)
                 return
 
             # Fresh Request object per attempt — cheap, and avoids any risk
             # of urllib mutating headers on a reused one across retries.
             req = urllib.request.Request(url, data=body or None, headers=upstream_headers, method=method)
-            stop_heartbeat = self._start_heartbeat(req_id) if heartbeat_ok else None
+            stop_heartbeat = self._start_heartbeat(req_id, trace) if heartbeat_ok else None
+            t_upstream = time.monotonic()
             try:
                 try:
                     with urllib.request.urlopen(req, timeout=UPSTREAM_TIMEOUT_SEC) as resp:
@@ -727,24 +877,31 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         # out: both write to the same wfile, and the join
                         # inside _stop_heartbeat is what keeps a keepalive
                         # comment from being spliced into a chunk.
-                        stop_heartbeat and stop_heartbeat()
+                        if stop_heartbeat:
+                            stop_heartbeat()
+                            if trace.heartbeat_committed:
+                                # The keepalive had already taken over the
+                                # response by the time a real one showed up.
+                                trace.bridged = True
                         if VALIDATE_RESPONSE_BODY:
                             usage, out_bytes = self._relay_buffered(
                                 req_id, resp.status, resp.getheaders(), resp, method)
                         else:
                             usage, out_bytes = self._relay(req_id, resp.status, resp.getheaders(), resp)
                 finally:
+                    trace.upstream_sec += time.monotonic() - t_upstream
                     stop_heartbeat and stop_heartbeat()
                 # Something got through, so whatever limit was in force has
                 # lifted — let anyone still queued behind the gate move.
                 _gate_clear()
-                _print_stats(req_id, usage, time.monotonic() - _t0, in_bytes, out_bytes)
+                _print_stats(req_id, usage, trace, in_bytes, out_bytes, outcome="OK")
                 return
             except _ClientGone:
                 return
             except _ResponseAborted:
                 return
             except _InvalidUpstreamBody as e:
+                trace.failures.append(f"{e.status} body")
                 retrying = RETRY_ENABLED and e.retryable and attempt < max_attempts
                 if retrying and deadline is not None and \
                         time.monotonic() + BODY_RETRY_PAUSE_SECONDS > deadline:
@@ -768,19 +925,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                         f"{BODY_RETRY_PAUSE_SECONDS:.1f}s (config default; not sent to Kilo)",
                         flush=True,
                     )
+                    t_wait = time.monotonic()
                     time.sleep(BODY_RETRY_PAUSE_SECONDS)
+                    trace.wait_sec += time.monotonic() - t_wait
                     continue
 
-                _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, len(e.raw))
+                _print_stats(req_id, None, trace, in_bytes, len(e.raw), outcome="429")
 
                 # Retry budget used up on a body that never came back
                 # intact. Forwarding it as-is is exactly the bug we're
                 # fixing (Kilo choking on a spliced-in "HTTP/1.1 502 Bad
                 # Gateway" mid-JSON-string) — mask it the same predictable
                 # way as an exhausted status-code retry instead.
-                self._write_masked_retry(req_id, f"malformed body: {e.reason}")
+                self._write_masked_retry(req_id, f"malformed body: {e.reason}", trace=trace)
                 return
             except urllib.error.HTTPError as e:
+                trace.failures.append(str(e.code))
                 err_body = e.read()
                 headers = list(e.headers.items()) if e.headers else []
                 code_is_retryable = e.code in RETRY_STATUS_CODES
@@ -839,9 +999,13 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     _gate_penalize(pause)
                     continue
 
-                _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, len(err_body))
+                will_mask_as_429 = RETRY_ENABLED and code_is_retryable
+                _print_stats(
+                    req_id, None, trace, in_bytes, len(err_body),
+                    outcome="429" if will_mask_as_429 else str(e.code),
+                )
 
-                if RETRY_ENABLED and code_is_retryable:
+                if will_mask_as_429:
                     # Giving up here means the client will come back, so the
                     # number we hand it has to be one we'd honour ourselves:
                     # arm the gate for the same span rather than letting the
@@ -855,14 +1019,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     # copes with a plain 429 + Retry-After far better than
                     # with whichever shape happened to come back last. The
                     # real status/body is still in the log above.
-                    self._write_masked_retry(req_id, e.code, retry_after=last_pause)
+                    self._write_masked_retry(req_id, e.code, retry_after=last_pause,
+                                              trace=trace)
                 else:
                     self._write_final(req_id, e.code, headers, err_body, "error_forward")
                 return
             except Exception as e:
                 print(f"!! [{req_id}] {type(e).__name__}: {e}", flush=True)
                 write_log({"type": "error", "id": req_id, "error": f"{type(e).__name__}: {e}"})
-                _print_stats(req_id, None, time.monotonic() - _t0, in_bytes, 0)
+                _print_stats(req_id, None, trace, in_bytes, 0, outcome="502")
                 self._write_final(req_id, 502, [], str(e).encode(), "network_error")
                 return
             finally:
@@ -871,7 +1036,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 _release_slot()
                 _end_turn(probing)
 
-    def _start_heartbeat(self, req_id):
+    def _start_heartbeat(self, req_id, trace: "_ReqTrace" = None):
         """Begin an SSE keepalive drip; returns a stop() callable.
 
         The thread sleeps HEARTBEAT_AFTER_SEC first and does nothing at
@@ -890,6 +1055,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     ("Cache-Control", "no-cache"),
                 ])
                 self._heartbeat_active = True
+                if trace is not None:
+                    trace.heartbeat_committed = True
+                    trace.heartbeat_committed_at = time.monotonic()
                 print(
                     f".. [{req_id}] upstream silent for {HEARTBEAT_AFTER_SEC:.0f}s \u2014 "
                     f"holding the client with SSE keepalives every "
@@ -950,7 +1118,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             write_log({"type": "client_disconnected", "id": req_id, "stage": stage})
             return False
 
-    def _write_masked_retry(self, req_id, original, retry_after=None):
+    def _write_masked_retry(self, req_id, original, retry_after=None, trace: "_ReqTrace" = None):
         """Send Kilo one predictable shape after we give up retrying.
 
         `original` is whatever actually went wrong — an upstream status
@@ -963,6 +1131,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         for, what the shared cooldown still has to run, and the configured
         pause_seconds. Sending a flat config value instead would send the
         client back before the limit it just hit has cleared.
+
+        This is the ONLY call site through which a masked-429 response
+        leaves the proxy — an exhausted retry loop, a cooldown longer than
+        the request's own budget, or no free upstream slot in time all end
+        up here. The console line deliberately does NOT repeat the date
+        and elapsed time: _print_stats (called right alongside this, at
+        every one of those call sites) is the single place that prints
+        those, so a person tailing the log never sees the same timestamp
+        twice for one request.
         """
         if retry_after is None:
             retry_after = RETRY_PAUSE_SECONDS
@@ -979,7 +1156,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             ("Retry-After", str(retry_after)),
         ]
         print(
-            f".. [{req_id}] retries exhausted on upstream {original} \u2014 "
+            f".. [{req_id}] giving up on upstream {original} \u2014 "
             f"masking to Kilo as 429 + Retry-After: {retry_after}s",
             flush=True,
         )
@@ -988,6 +1165,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "id": req_id,
             "status": 429,
             "masked_from": original,
+            "attempts": trace.attempts if trace is not None else None,
+            "elapsed_sec": round(trace.elapsed(), 3) if trace is not None else None,
             "headers": dict(headers),
             "body": json.loads(body),
         })
@@ -1255,7 +1434,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     server = http.server.ThreadingHTTPServer((HOST, PORT), ProxyHandler)
-    print(f"NVIDIA proxy listening on http://{HOST}:{PORT}  (logs -> {LOG_DIR}/*.jsonl)", flush=True)
+#    print(f"NVIDIA proxy listening on http://{HOST}:{PORT}  (logs -> {LOG_DIR}/*.jsonl)", flush=True)
+    print(
+        f"Proxy listening on http://{HOST}:{PORT} -> upstream "
+        f"{UPSTREAM_SCHEME}://{NVIDIA_HOST}  (logs -> {LOG_DIR}/*.jsonl)",
+        flush=True,
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
