@@ -736,6 +736,25 @@ def _validate_sse(raw: bytes):
             chunk = json.loads(payload)
         except json.JSONDecodeError:
             return False, "malformed SSE chunk (invalid JSON in a data: line)"
+        # Some upstreams (NVIDIA NIM / nvcf included) answer an overload
+        # or backend failure with HTTP 200 + text/event-stream instead of
+        # a real error status: a single {"error": {...}} chunk followed
+        # by a clean data: [DONE]. Structurally that looks complete (a
+        # [DONE] is present, and there were never any "choices" to be
+        # missing a finish_reason), so without this check it sails
+        # through validation and Kilo receives the disguised error as if
+        # it were a normal response. Treat a chunk carrying a top-level
+        # "error" field (any truthy value — non-empty dict or non-empty
+        # string) as a failure so it takes the same retry / masked-429 path
+        # as a genuine 4xx/5xx. Falsy values (null, false, "", {}) are
+        # ignored: they carry no actionable error information.
+        err = chunk.get("error") if isinstance(chunk, dict) else None
+        if err:
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("type") or "upstream error in stream"
+            else:
+                detail = str(err)
+            return False, f"upstream sent an error chunk inside a 200 stream: {detail}"
         choices = chunk.get("choices") if isinstance(chunk, dict) else None
         if isinstance(choices, list) and choices:
             saw_choices = True
