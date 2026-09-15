@@ -136,6 +136,14 @@ REQUIRE_STREAM_FINISH_REASON = bool(_RETRY_CFG.get("require_stream_finish_reason
 # retries here would hold the client for minutes over a hiccup that clears
 # in one retry.
 BODY_RETRY_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("body_retry_pause_seconds", 2.0)))
+# A network-level failure (connect/read timeout, DNS lookup failure, reset
+# connection — nothing ever came back, not even a status line) used to skip
+# the retry system entirely and hand Kilo a 502 on the very first attempt.
+# Kilo then ran its OWN exponential backoff on top of that, which is what
+# let a single flaky minute balloon into requests spaced hours apart. This
+# is the flat pause used instead: warn on the console, wait, and silently
+# retry the same request, exactly like a 500/502 upstream response.
+NETWORK_ERROR_PAUSE_SECONDS = max(0.0, float(_RETRY_CFG.get("network_error_pause_seconds", 60.0)))
 
 # --- keeping parallel requests from fighting each other over a rate limit ---
 # Each in-flight request runs in its own thread with its own retry loop, so
@@ -1116,6 +1124,37 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                                               trace=trace, host_state=host_state)
                 else:
                     self._write_final(req_id, e.code, headers, err_body, "error_forward")
+                return
+            except _UPSTREAM_READ_ERRORS as e:
+                # Nothing came back at all — a stalled read, a dropped
+                # connection, a DNS lookup that failed. Treated the same as
+                # a retryable upstream status: warn, pause a flat minute,
+                # and silently retry, instead of failing to Kilo on attempt
+                # 1 and letting its own backoff spiral (see
+                # NETWORK_ERROR_PAUSE_SECONDS above).
+                trace.failures.append(type(e).__name__)
+                retrying = RETRY_ENABLED and attempt < max_attempts
+                if retrying and deadline is not None and \
+                        time.monotonic() + NETWORK_ERROR_PAUSE_SECONDS > deadline:
+                    retrying = False
+
+                write_log({"type": "error", "id": req_id,
+                           "error": f"{type(e).__name__}: {e}",
+                           "attempt": attempt, "retrying": retrying})
+
+                if retrying:
+                    print(
+                        f"!! [{req_id}] {type(e).__name__}: {e} — retry "
+                        f"{attempt}/{max_attempts - 1} in "
+                        f"{NETWORK_ERROR_PAUSE_SECONDS:.0f}s (not sent to Kilo)",
+                        flush=True,
+                    )
+                    _gate_penalize(host_state, NETWORK_ERROR_PAUSE_SECONDS)
+                    continue
+
+                print(f"!! [{req_id}] {type(e).__name__}: {e}", flush=True)
+                _print_stats(req_id, None, trace, in_bytes, 0, outcome="502")
+                self._write_final(req_id, 502, [], str(e).encode(), "network_error")
                 return
             except Exception as e:
                 print(f"!! [{req_id}] {type(e).__name__}: {e}", flush=True)

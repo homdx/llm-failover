@@ -8,7 +8,7 @@ scheme = "https"
 #for ollama scheme = "http"
 #for ollama host = "localhost:11434"
 #timeout 1 hour for ollama 3600
-timeout_sec = 239   # per-attempt urlopen timeout to NVIDIA
+timeout_sec = 60   # per-attempt urlopen timeout to NVIDIA
 # If the upstream has already sent at least one byte for a response but
 # then goes idle for longer than timeout_sec, that single stall is
 # tolerated instead of failing the request, and the read is retried in
@@ -17,7 +17,7 @@ timeout_sec = 239   # per-attempt urlopen timeout to NVIDIA
 # byte) is unaffected and still fails at the plain timeout_sec above.
 # This does not remove the timeout, it only widens it while data is
 # still trickling in. 900 = 15 minutes.
-stream_max_wait_sec = 900
+stream_max_wait_sec = 300
 # How long the upstream may stay completely silent before the proxy starts
 # holding the CLIENT's connection open on its own, by committing to a 200
 # text/event-stream and dripping ignorable ": keepalive" SSE comments until
@@ -29,35 +29,21 @@ stream_max_wait_sec = 900
 # stream instead of as a status. Keep this ABOVE a normal error round-trip
 # so ordinary 4xx/5xx still come back as real statuses, and BELOW the
 # client's own timeout. 0 = off, exactly the old behaviour.
-heartbeat_after_sec = 240
+heartbeat_after_sec = 90
 # Gap between keepalive comments once the drip has started.
 heartbeat_interval_sec = 20
-
-[keys]
-# Optional: transparent per-key upstream routing via the api_manager.py
-# sqlite store (api_manager.py add/list/get/update/rm). When the client's
-# api key (Authorization: Bearer ..., api-key, or x-api-key header) matches
-# an entry's api_key column, THAT entry's host/scheme are used for this
-# request instead of [upstream].host/scheme above — every other setting in
-# this file (timeouts, retry, logging, ...) still applies unchanged, and
-# max_concurrent_upstream/the retry cooldown are tracked per host rather
-# than pooled, so one key's rate limit can't block another key's host.
-# Leave unset to use api_manager's own default
-# ($API_MANAGER_DB or ~/.config/api-manager/entries.db). No db file at
-# this path, or a request whose key isn't in it, is not an error: the
-# proxy logs it to the console and falls back to [upstream] above.
-#db_path = "/home/you/.config/api-manager/entries.db"
 
 [proxy]
 # Leave false if you're launching this with `proxychains4 python3 main.py`.
 # Set true (and fill in the two fields below) only if you want the script
 # itself to tunnel through SOCKS5 instead of relying on proxychains.
-use_socks5 = false
+use_socks5 = true
 socks5_host = "127.0.0.1"
 socks5_port = 1080
 
 [logging]
 enabled = true
+#true
 log_dir = "logs"
 # Cap on how many bytes of each response body get written to the log file.
 body_limit_bytes = 200000
@@ -75,12 +61,20 @@ max_attempts = 10       # total tries, including the first — so 2 retries here
 # when neither is present. 500/502/529 almost never carry a Retry-After
 # header or a body hint, so in practice this fallback IS the wait for
 # those three.
-pause_seconds = 15
+pause_seconds = 10
 # A resolved wait longer than this (header or body hint) is treated as a
 # quota reset rather than a transient limit — the error is forwarded to
 # Kilo immediately instead of holding its connection open that long.
 max_pause_seconds = 180
 #for ollama 1800
+# A network-level failure (connect/read timeout, DNS failure, dropped
+# connection — nothing came back at all, not even a status line) is not an
+# upstream status code, so status_codes/pause_seconds above don't cover it.
+# Previously this skipped retrying entirely and sent Kilo a 502 on the
+# first attempt, which made Kilo's OWN exponential backoff balloon to
+# hours after just one flaky minute. Now it's retried the same as a
+# 500/502, with this flat pause instead of a growing one.
+network_error_pause_seconds = 60
 # Buffer the WHOLE upstream response and check it's structurally intact
 # before sending anything to Kilo. This is what makes a real silent
 # retry possible on a body that's corrupted or truncated MID-stream (a
@@ -126,7 +120,7 @@ body_retry_pause_seconds = 2
 # (the old behaviour). Set this to the number of parallel requests the
 # provider actually tolerates — for a single free-tier key that is usually
 # 1 or 2. Extra requests queue instead of piling onto the limit.
-max_concurrent_upstream = 2
+max_concurrent_upstream = 3
 # Ceiling on how long ONE request may spend retrying before it answers the
 # client. 0 = unlimited (the old behaviour). Keep it under the client's own
 # timeout: retrying for 63s when Kilo gave up at 30s means the answer is
