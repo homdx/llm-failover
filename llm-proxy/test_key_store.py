@@ -164,3 +164,84 @@ def test_lookup_works_even_while_another_connection_holds_the_db_open(db_with_on
         assert entry is not None
     finally:
         keep_open.close()
+
+
+# --------------------------------------------------------------------------- lookup: the entry_keys failover pool
+
+
+def test_lookup_returns_empty_pool_when_nothing_was_ever_added(db_with_one_entry):
+    entry = key_store.lookup("sk-or-v1-abcdefghijklmnop", db_with_one_entry)
+    assert entry.api_keys == ()
+
+
+def test_lookup_returns_pool_in_the_order_keys_were_added(db_with_one_entry):
+    with am.ApiStore(db_with_one_entry) as store:
+        store.add_key("openrouter", "sk-proxy-c")
+        store.add_key("openrouter", "sk-proxy-a")
+        store.add_key("openrouter", "sk-proxy-b")
+    entry = key_store.lookup("sk-or-v1-abcdefghijklmnop", db_with_one_entry)
+    assert entry.api_keys == ("sk-proxy-c", "sk-proxy-a", "sk-proxy-b")
+
+
+def test_lookup_pool_is_scoped_to_the_matched_entry_only(tmp_path):
+    db_path = tmp_path / "entries.db"
+    with am.ApiStore(db_path) as store:
+        store.add("openrouter", api_key="sk-client-or", base_url="https://openrouter.ai/api/v1", host="openrouter.ai")
+        store.add("openai", api_key="sk-client-oa", base_url="https://api.openai.com/v1", host="api.openai.com")
+        store.add_key("openrouter", "sk-or-pool-1")
+        store.add_key("openrouter", "sk-or-pool-2")
+        # openai's pool is left empty on purpose.
+
+    or_entry = key_store.lookup("sk-client-or", db_path)
+    oa_entry = key_store.lookup("sk-client-oa", db_path)
+    assert or_entry.api_keys == ("sk-or-pool-1", "sk-or-pool-2")
+    assert oa_entry.api_keys == ()
+
+
+def test_lookup_pool_survives_removing_one_key(db_with_one_entry):
+    with am.ApiStore(db_with_one_entry) as store:
+        store.add_key("openrouter", "sk-a")
+        store.add_key("openrouter", "sk-b")
+        store.remove_key("openrouter", "sk-a")
+    entry = key_store.lookup("sk-or-v1-abcdefghijklmnop", db_with_one_entry)
+    assert entry.api_keys == ("sk-b",)
+
+
+def test_lookup_pool_empty_again_after_clear(db_with_one_entry):
+    with am.ApiStore(db_with_one_entry) as store:
+        store.add_key("openrouter", "sk-a")
+        store.clear_keys("openrouter")
+    entry = key_store.lookup("sk-or-v1-abcdefghijklmnop", db_with_one_entry)
+    assert entry.api_keys == ()
+
+
+def test_lookup_tolerates_a_db_with_no_entry_keys_table(tmp_path):
+    # A database written by a version of api_manager.py from before the
+    # entry_keys table existed. lookup() must still resolve the host --
+    # it just reports an empty pool instead of erroring.
+    db_path = tmp_path / "entries.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript("""
+        CREATE TABLE entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            host TEXT NOT NULL,
+            base_url TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+    """)
+    conn.execute(
+        "INSERT INTO entries (name, host, base_url, api_key, note, created_at, updated_at) "
+        "VALUES ('openrouter', 'openrouter.ai', 'https://openrouter.ai/api/v1', "
+        "'sk-or-v1-abcdefghijklmnop', NULL, '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z')"
+    )
+    conn.commit()
+    conn.close()
+
+    entry = key_store.lookup("sk-or-v1-abcdefghijklmnop", db_path)
+    assert entry is not None
+    assert entry.host == "openrouter.ai"
+    assert entry.api_keys == ()

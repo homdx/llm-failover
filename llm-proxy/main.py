@@ -88,6 +88,34 @@ if USER_AGENT_OVERRIDE:
             "control characters."
         )
 
+# --- multi-key failover for the SAME provider -----------------------------
+# This is a different thing from the per-key upstream ROUTING just below:
+# routing maps a key the CLIENT sent to a different host/scheme via
+# sqlite; this instead gives the PROXY its own pool of keys to use
+# against the single upstream configured above.
+#
+# [upstream] api_keys = ["key1", "key2", ...] — two or more provider API
+# keys, tried in order. When set, every outbound request's
+# Authorization/api-key/x-api-key header (whatever Kilo itself sent) is
+# replaced with one of these instead. A 4xx or 5xx response from the
+# upstream switches to the NEXT key immediately — no pause, no backoff,
+# no shared cooldown — and resends the same request. This repeats key by
+# key; the LAST configured key's response is always what Kilo gets,
+# forwarded exactly as the upstream sent it (never masked as a 429, unlike
+# the single-key retry path further down in _proxy).
+#
+# Absent, empty, or exactly one entry: fully transparent — Kilo's own
+# credential header passes straight through unchanged, i.e. today's
+# behaviour.
+_RAW_UPSTREAM_API_KEYS = CONFIG["upstream"].get("api_keys", [])
+if not isinstance(_RAW_UPSTREAM_API_KEYS, list) or not all(
+    isinstance(k, str) for k in _RAW_UPSTREAM_API_KEYS
+):
+    raise SystemExit("config.toml [upstream] api_keys must be a list of strings.")
+if any(not k.strip() for k in _RAW_UPSTREAM_API_KEYS):
+    raise SystemExit("config.toml [upstream] api_keys must not contain empty strings.")
+UPSTREAM_API_KEYS = _RAW_UPSTREAM_API_KEYS
+
 # --- transparent per-key upstream routing via the api_manager sqlite store ---
 # Optional [keys] section in config.toml; .get(...) so an existing
 # config.toml without it still works and this is a no-op. When the
@@ -702,7 +730,7 @@ def _redact_headers(headers: dict) -> dict:
     }
 
 
-def _build_upstream_headers(client_headers, upstream_host):
+def _build_upstream_headers(client_headers, upstream_host, override_key=None):
     """Headers to send upstream, derived from what the client sent.
 
     Hop-by-hop / recomputed headers (STRIP_REQUEST_HEADERS) are dropped.
@@ -714,6 +742,16 @@ def _build_upstream_headers(client_headers, upstream_host):
         attribute the request to Kilo Code.  HTTP-Referer is the header
         OpenRouter reads to display "Kilo Code" in the app dashboard.
     When user_agent is empty/absent all client headers pass through unchanged.
+
+    override_key: multi-key failover, from either a sqlite entry's own
+    pool or the static [upstream] api_keys in config.toml (see
+    UPSTREAM_API_KEYS and _resolve_upstream). When not None, every
+    credential header the client sent (Authorization / api-key /
+    x-api-key — the same set REDACT_HEADERS names) is dropped and
+    replaced with a single "Authorization: Bearer <override_key>" header,
+    so this key reaches the upstream regardless of what Kilo was
+    configured with. None (the default) leaves the client's own
+    credential header(s) untouched — today's pass-through behaviour.
     """
     items = client_headers.items() if hasattr(client_headers, "items") else client_headers
     out = {}
@@ -723,16 +761,20 @@ def _build_upstream_headers(client_headers, upstream_host):
             continue
         if USER_AGENT_OVERRIDE and (lk == "user-agent" or lk in KILO_IDENTITY_HEADERS):
             continue
+        if override_key is not None and lk in REDACT_HEADERS:
+            continue
         out[k] = v
     if USER_AGENT_OVERRIDE:
         out["User-Agent"] = USER_AGENT_OVERRIDE
+    if override_key is not None:
+        out["Authorization"] = f"Bearer {override_key}"
     out["Host"] = upstream_host
     out["Accept-Encoding"] = "identity"
     return out
 
 
 def _resolve_upstream(req_id, headers):
-    """Return (host, scheme) for this request.
+    """Return (host, scheme, entry_api_keys) for this request.
 
     Transparent by construction: with no [keys].db_path configured and no
     file at the default location, this returns the config.toml default on
@@ -740,25 +782,36 @@ def _resolve_upstream(req_id, headers):
     exists do we bother parsing an api key out of the request and looking
     it up — a miss there (key missing, or not in the db) falls back to the
     same default and prints why, so a bad/rotated key doesn't fail silently.
+
+    entry_api_keys is the matched entry's OWN pool of upstream failover
+    keys (api_manager.py's `keys add/rm/clear`), as a tuple — empty when
+    no entry matched, or when it matched but nothing has ever been added
+    to its pool. The caller falls back to the static [upstream] api_keys
+    in config.toml whenever this comes back empty, the same way the host
+    itself falls back to [upstream].host on a miss.
     """
     if not key_store.db_available(KEY_STORE_DB_PATH):
-        return NVIDIA_HOST, UPSTREAM_SCHEME
+        return NVIDIA_HOST, UPSTREAM_SCHEME, ()
     api_key = key_store.extract_api_key(headers)
     entry = key_store.lookup(api_key, KEY_STORE_DB_PATH) if api_key else None
     if entry is not None:
+        pool_note = (
+            f", using its own pool of {len(entry.api_keys)} failover key(s)"
+            if entry.api_keys else ""
+        )
         print(
             f".. [{req_id}] api key {key_store.mask_key(api_key)} matched "
-            f"'{entry.name}' — routing to {entry.scheme}://{entry.host}",
+            f"'{entry.name}' — routing to {entry.scheme}://{entry.host}{pool_note}",
             flush=True,
         )
-        return entry.host, entry.scheme
+        return entry.host, entry.scheme, entry.api_keys
     print(
         f".. [{req_id}] api key not found in {KEY_STORE_DB_PATH} "
         f"(saw {key_store.mask_key(api_key)}) — falling back to default "
         f"upstream {UPSTREAM_SCHEME}://{NVIDIA_HOST} from config.toml",
         flush=True,
     )
-    return NVIDIA_HOST, UPSTREAM_SCHEME
+    return NVIDIA_HOST, UPSTREAM_SCHEME, ()
 
 
 def _parse_body(raw: bytes, content_type: str):
@@ -974,10 +1027,26 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "body": _parse_body(body, self.headers.get("Content-Type", "")),
         })
 
-        upstream_host, upstream_scheme = _resolve_upstream(req_id, self.headers)
+        upstream_host, upstream_scheme, sqlite_api_keys = _resolve_upstream(req_id, self.headers)
         host_state = _get_host_state(upstream_host)
 
-        upstream_headers = _build_upstream_headers(self.headers, upstream_host)
+        # Multi-key failover: two or more keys configured for this
+        # provider, from EITHER of two sources. A sqlite entry's own pool
+        # (api_manager.py's `keys add`) wins when it has one — it's the
+        # more specific match, same as its host winning over
+        # [upstream].host — otherwise the static [upstream] api_keys in
+        # config.toml is used. key_index tracks which one is currently in
+        # use; switching keys (see the HTTPError handler below) rebuilds
+        # upstream_headers with the next one. Fewer than two keys from
+        # either source leaves override_key at None, so Kilo's own
+        # credential header passes through exactly as before.
+        api_keys = sqlite_api_keys if sqlite_api_keys else UPSTREAM_API_KEYS
+        multi_key = len(api_keys) >= 2
+        key_index = 0
+        upstream_headers = _build_upstream_headers(
+            self.headers, upstream_host,
+            override_key=api_keys[0] if multi_key else None,
+        )
 
         url = f"{upstream_scheme}://{upstream_host}{self.path}"
 
@@ -986,6 +1055,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         is_stream = _wants_stream(body)
         heartbeat_ok = HEARTBEAT_AFTER_SEC > 0 and is_stream
         max_attempts = RETRY_MAX_ATTEMPTS if RETRY_ENABLED else 1
+        if multi_key:
+            # Every configured key gets at least one attempt regardless of
+            # [retry] enabled/max_attempts — key rotation is a separate
+            # mechanism from the status-code retry-with-backoff below (see
+            # the HTTPError handler).
+            max_attempts = max(max_attempts, len(api_keys))
         deadline = _t0 + MAX_TOTAL_RETRY_SECONDS if MAX_TOTAL_RETRY_SECONDS > 0 else None
         last_pause = RETRY_PAUSE_SECONDS
 
@@ -1105,6 +1180,52 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 trace.failures.append(str(e.code))
                 err_body = e.read()
                 headers = list(e.headers.items()) if e.headers else []
+
+                if multi_key and 400 <= e.code < 600:
+                    # Key rotation: a distinct mechanism from the retry-
+                    # with-backoff path below. No pause, no shared cooldown,
+                    # no masking — move straight to the next key, or, once
+                    # there's no key (or attempt) left to move to, forward
+                    # exactly what came back.
+                    can_rotate = (
+                        key_index < len(api_keys) - 1
+                        and attempt < max_attempts
+                    )
+                    write_log({
+                        "type": "response",
+                        "id": req_id,
+                        "status": e.code,
+                        "attempt": attempt,
+                        "retrying": can_rotate,
+                        "key": f"{key_index + 1}/{len(api_keys)}",
+                        "key_source": "sqlite" if sqlite_api_keys else "config",
+                        "headers": dict(headers),
+                        "body": _parse_body(err_body, _get_ci(headers, "Content-Type")),
+                    })
+                    if can_rotate:
+                        print(
+                            f".. [{req_id}] upstream {e.code} on key "
+                            f"{key_index + 1}/{len(api_keys)} \u2014 trying key "
+                            f"{key_index + 2}/{len(api_keys)} immediately "
+                            f"(not sent to Kilo)",
+                            flush=True,
+                        )
+                        key_index += 1
+                        upstream_headers = _build_upstream_headers(
+                            self.headers, upstream_host,
+                            override_key=api_keys[key_index],
+                        )
+                        continue
+                    print(
+                        f".. [{req_id}] upstream {e.code} on key "
+                        f"{key_index + 1}/{len(api_keys)} \u2014 no more keys/"
+                        f"attempts left, forwarding as-is",
+                        flush=True,
+                    )
+                    _print_stats(req_id, None, trace, in_bytes, len(err_body), outcome=str(e.code))
+                    self._write_final(req_id, e.code, headers, err_body, "error_forward")
+                    return
+
                 code_is_retryable = e.code in RETRY_STATUS_CODES
                 retrying = RETRY_ENABLED and code_is_retryable and attempt < max_attempts
 
