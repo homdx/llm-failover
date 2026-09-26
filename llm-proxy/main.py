@@ -52,6 +52,42 @@ NVIDIA_HOST = CONFIG["upstream"]["host"]
 # Ollama (e.g. localhost:11434), which doesn't speak TLS.
 UPSTREAM_SCHEME = CONFIG["upstream"].get("scheme", "https")
 
+# Optional client-name override. Kilo stamps its own User-Agent on every
+# request; some upstreams (Cloudflare-fronted ones in particular) filter
+# on that string. When [upstream] user_agent is set to a non-empty value,
+# the client's User-Agent is DROPPED and this one is sent in its place,
+# e.g.
+#     user_agent = "learn-in-play1-llm-client/1.0 (+https://github.com/homdx/learn-in-play1)"
+# Empty / absent = off: the client's User-Agent is forwarded untouched,
+# exactly as before. Validated here, at startup, so a bad value fails
+# loudly now instead of as an obscure error on the first request.
+_UA_RAW = CONFIG["upstream"].get("user_agent", "")
+if not isinstance(_UA_RAW, str):
+    raise SystemExit(
+        "config.toml [upstream] user_agent must be a string, got "
+        f"{type(_UA_RAW).__name__}."
+    )
+USER_AGENT_OVERRIDE = _UA_RAW.strip()
+# Kilo Code stamps these on every request to identify itself to OpenRouter.
+# When USER_AGENT_OVERRIDE is active they are also stripped so the upstream
+# cannot attribute the traffic to Kilo Code.  Note: HTTP-Referer is the
+# header OpenRouter actually reads for app attribution -- not User-Agent.
+KILO_IDENTITY_HEADERS = frozenset({"http-referer", "x-title", "x-kilocode-version"})
+if USER_AGENT_OVERRIDE:
+    # encode("latin-1") was used here before, but latin-1 is a superset of
+    # ASCII and silently allows bytes 128-255 (accented letters, C1 controls)
+    # that can break strict HTTP servers.  isascii() is the right check.
+    if not USER_AGENT_OVERRIDE.isascii():
+        raise SystemExit(
+            "config.toml [upstream] user_agent contains characters that can't "
+            "be sent in an HTTP header (use plain ASCII)."
+        )
+    if any(ord(c) < 32 or ord(c) == 127 for c in USER_AGENT_OVERRIDE):
+        raise SystemExit(
+            "config.toml [upstream] user_agent must be a single line with no "
+            "control characters."
+        )
+
 # --- transparent per-key upstream routing via the api_manager sqlite store ---
 # Optional [keys] section in config.toml; .get(...) so an existing
 # config.toml without it still works and this is a no-op. When the
@@ -666,6 +702,35 @@ def _redact_headers(headers: dict) -> dict:
     }
 
 
+def _build_upstream_headers(client_headers, upstream_host):
+    """Headers to send upstream, derived from what the client sent.
+
+    Hop-by-hop / recomputed headers (STRIP_REQUEST_HEADERS) are dropped.
+    If [upstream] user_agent is configured:
+      - EVERY User-Agent the client sent is dropped and the configured one
+        is injected instead (also when the client sent none).
+      - Kilo-specific identity headers (HTTP-Referer, X-Title,
+        X-KiloCode-Version) are also stripped so the upstream cannot
+        attribute the request to Kilo Code.  HTTP-Referer is the header
+        OpenRouter reads to display "Kilo Code" in the app dashboard.
+    When user_agent is empty/absent all client headers pass through unchanged.
+    """
+    items = client_headers.items() if hasattr(client_headers, "items") else client_headers
+    out = {}
+    for k, v in items:
+        lk = k.lower()
+        if lk in STRIP_REQUEST_HEADERS:
+            continue
+        if USER_AGENT_OVERRIDE and (lk == "user-agent" or lk in KILO_IDENTITY_HEADERS):
+            continue
+        out[k] = v
+    if USER_AGENT_OVERRIDE:
+        out["User-Agent"] = USER_AGENT_OVERRIDE
+    out["Host"] = upstream_host
+    out["Accept-Encoding"] = "identity"
+    return out
+
+
 def _resolve_upstream(req_id, headers):
     """Return (host, scheme) for this request.
 
@@ -905,18 +970,14 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             "method": method,
             "path": self.path,
             "headers": _redact_headers(dict(self.headers.items())),
+            **({"user_agent_sent_upstream": USER_AGENT_OVERRIDE} if USER_AGENT_OVERRIDE else {}),
             "body": _parse_body(body, self.headers.get("Content-Type", "")),
         })
 
         upstream_host, upstream_scheme = _resolve_upstream(req_id, self.headers)
         host_state = _get_host_state(upstream_host)
 
-        upstream_headers = {
-            k: v for k, v in self.headers.items()
-            if k.lower() not in STRIP_REQUEST_HEADERS
-        }
-        upstream_headers["Host"] = upstream_host
-        upstream_headers["Accept-Encoding"] = "identity"
+        upstream_headers = _build_upstream_headers(self.headers, upstream_host)
 
         url = f"{upstream_scheme}://{upstream_host}{self.path}"
 
@@ -1574,6 +1635,8 @@ if __name__ == "__main__":
         f"{UPSTREAM_SCHEME}://{NVIDIA_HOST}  (logs -> {LOG_DIR}/*.jsonl)",
         flush=True,
     )
+    if USER_AGENT_OVERRIDE:
+        print(f"User-Agent from the client is replaced with: {USER_AGENT_OVERRIDE}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

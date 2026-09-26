@@ -3,137 +3,132 @@ host = "127.0.0.1"
 port = 8080
 
 [upstream]
-host = "openai.example.ai"
+host = "openai.example.ai"      # replace with your provider's hostname
 scheme = "https"
-#for ollama scheme = "http"
-#for ollama host = "localhost:11434"
-#timeout 1 hour for ollama 3600
-timeout_sec = 60   # per-attempt urlopen timeout to NVIDIA
-# If the upstream has already sent at least one byte for a response but
-# then goes idle for longer than timeout_sec, that single stall is
-# tolerated instead of failing the request, and the read is retried in
-# place — as long as the TOTAL time spent on that response stays under
-# stream_max_wait_sec. A completely silent upstream (never sends a
-# byte) is unaffected and still fails at the plain timeout_sec above.
-# This does not remove the timeout, it only widens it while data is
-# still trickling in. 900 = 15 minutes.
+# For Ollama: scheme = "http"
+# For Ollama: host = "localhost:11434"
+
+# Per-attempt connect/read timeout to the upstream (seconds).
+# For Ollama use 3600 (1 hour).
+timeout_sec = 60
+
+# If the upstream has already sent at least one byte but then goes idle,
+# the proxy keeps retrying reads until this many seconds have elapsed in
+# total on that response.  Ordinary silent upstreams still hit timeout_sec.
+# 300 = 5 minutes; 900 = 15 minutes for Ollama.
 stream_max_wait_sec = 300
-# How long the upstream may stay completely silent before the proxy starts
-# holding the CLIENT's connection open on its own, by committing to a 200
-# text/event-stream and dripping ignorable ": keepalive" SSE comments until
-# the real response arrives. This is what defeats the client-side 5-minute
-# cutoff (undici's default headersTimeout) while a cold model loads.
-# Only ever applied to requests that asked for "stream": true.
-# Trade-off: the status code is spent early, so once the drip has started a
-# masked 429 / upstream error is delivered as an error chunk inside the
-# stream instead of as a status. Keep this ABOVE a normal error round-trip
-# so ordinary 4xx/5xx still come back as real statuses, and BELOW the
-# client's own timeout. 0 = off, exactly the old behaviour.
+
+# How long the upstream may be completely silent before the proxy starts
+# drippping ": keepalive" SSE comments to the client, committing to HTTP 200
+# early so the client's headersTimeout (undici default: 5 min) is never hit.
+# Only applied when "stream": true.  Trade-off: status code is spent early,
+# so a masked 429/error arrives as an error chunk, not a real status.
+# Set ABOVE a normal error round-trip, BELOW the client's own timeout.
+# 0 = off (old behaviour).
 heartbeat_after_sec = 90
+
 # Gap between keepalive comments once the drip has started.
 heartbeat_interval_sec = 20
 
+# Optional User-Agent override.
+#
+# Some Cloudflare-fronted upstreams block or fingerprint Kilo Code's
+# User-Agent string.  When user_agent is set to a non-empty value the proxy:
+#   1. Drops EVERY User-Agent header the client sent (even duplicates).
+#   2. Injects this string instead — on every attempt, including retries.
+#   3. Also strips Kilo's identity headers that OpenRouter reads for its
+#      app dashboard: HTTP-Referer, X-Title, X-KiloCode-Version.
+#
+# Rules enforced at startup (bad value → clear error, no silent failure):
+#   • Must be a quoted string (not a number, not a boolean).
+#   • Must be plain ASCII — no accented letters, no Cyrillic, etc.
+#   • Must be a single line — no newlines or other control characters.
+#
+# Empty string or whitespace-only string = off; client's UA passes through.
+#
+# Example — replace with your own project name/URL:
+# user_agent = "my-llm-client/1.0 (+https://github.com/you/your-repo)"
+user_agent = ""
+# ──────────────────────────────────────────────────────────────────────────
+
 [proxy]
-# Leave false if you're launching this with `proxychains4 python3 main.py`.
-# Set true (and fill in the two fields below) only if you want the script
-# itself to tunnel through SOCKS5 instead of relying on proxychains.
+# Set false if you launch with `proxychains4 python3 main.py`.
+# Set true to have the script itself tunnel through SOCKS5.
 use_socks5 = true
 socks5_host = "127.0.0.1"
 socks5_port = 1080
 
 [logging]
 enabled = true
-#true
 log_dir = "logs"
-# Cap on how many bytes of each response body get written to the log file.
+# Cap on how many bytes of each response body are written to the log file.
 body_limit_bytes = 200000
 
 [retry]
-# On these upstream status codes, hold the connection to Kilo open, wait,
-# and silently re-send the same request — Kilo only ever sees the final
-# outcome, never the failed attempt(s).
+# On these upstream status codes the proxy silently retries; the client
+# only ever sees the final outcome.
 enabled = true
-status_codes = [400, 425, 429, 500, 502, 529 ]
-max_attempts = 10       # total tries, including the first — so 2 retries here
-# pause_seconds is only the FALLBACK wait: if the upstream response has a
-# Retry-After header, or a "try again in Xms" / "retry in Xs" hint in the
-# error body, that number is used instead — pause_seconds only applies
-# when neither is present. 500/502/529 almost never carry a Retry-After
-# header or a body hint, so in practice this fallback IS the wait for
-# those three.
+status_codes = [400, 425, 429, 500, 502, 529]
+max_attempts = 10       # total tries including the first
+
+# Fallback pause between retries (seconds).  Overridden by a Retry-After
+# header or a "try again in Xms" hint in the error body when present.
+# 500/502/529 rarely carry hints, so this IS the wait for those codes.
 pause_seconds = 10
-# A resolved wait longer than this (header or body hint) is treated as a
-# quota reset rather than a transient limit — the error is forwarded to
-# Kilo immediately instead of holding its connection open that long.
+
+# A resolved wait longer than this is treated as a quota reset — the error
+# is forwarded to the client immediately rather than blocking that long.
 max_pause_seconds = 180
-#for ollama 1800
-# A network-level failure (connect/read timeout, DNS failure, dropped
-# connection — nothing came back at all, not even a status line) is not an
-# upstream status code, so status_codes/pause_seconds above don't cover it.
-# Previously this skipped retrying entirely and sent Kilo a 502 on the
-# first attempt, which made Kilo's OWN exponential backoff balloon to
-# hours after just one flaky minute. Now it's retried the same as a
-# 500/502, with this flat pause instead of a growing one.
+# For Ollama: 1800
+
+# Flat pause after a network-level failure (timeout, DNS failure, dropped
+# connection — no status line at all).  Retried like a 500/502.
 network_error_pause_seconds = 60
-# Buffer the WHOLE upstream response and check it's structurally intact
-# before sending anything to Kilo. This is what makes a real silent
-# retry possible on a body that's corrupted or truncated MID-stream (a
-# stray status line spliced into an SSE chunk, etc.) — a failure a
-# status-code check alone can't see, because the initial status was a
-# plain 200. Trade-off: Kilo no longer gets live token-by-token output,
-# it gets the whole response at once, after upstream finishes.
+
+# Buffer the whole upstream response and verify it is structurally intact
+# before forwarding to the client.  Enables silent retry on a mid-stream
+# corruption or truncation that a status-code check can't catch.
+# Trade-off: client receives the whole response at once, not token-by-token.
 validate_response_body = true
-# for ollama validate_response_body = false
-# Memory safety valve — once a response grows past this, it stops being
-# buffered and is streamed straight through to the client instead, with
-# no body validation (there is nothing left to validate against). It is
-# NOT treated as a failure: an over-sized response is still a response.
+# For Ollama: validate_response_body = false
+
+# Safety valve: once a buffered response exceeds this size it is streamed
+# through immediately with no validation.  Not a failure — just a bypass.
 # Shouldn't trigger for normal chat completions.
 max_buffer_bytes = 50000000
-# An SSE stream that just stops without a closing "data: [DONE]" counts
-# as truncated, even if every line seen so far was individually valid
-# JSON. Turn off if your upstream/model never sends one.
+
+# Treat an SSE stream that ends without "data: [DONE]" as truncated.
+# Disable only if your upstream never sends a closing [DONE].
 require_stream_done = false
-# The check that still catches a truncated stream when require_stream_done
-# is off: a completions stream in which no chunk ever reported a
-# finish_reason was cut off mid-generation. This is what a response killed
-# during a long reasoning phase looks like — the status is 200, every
-# data: line parses, and only the missing finish_reason gives it away.
-# Only applied to completion-shaped streams, and never when a closing
-# [DONE] arrived. Turn off only if your upstream omits finish_reason
-# entirely.
+
+# Treat a completion stream where NO chunk ever set finish_reason as
+# truncated — catches responses killed mid-generation when the status was
+# still 200 and every data: line parsed fine.
+# Disable only if your upstream omits finish_reason entirely.
 require_stream_finish_reason = true
-# Wait before re-sending after a FAILED BODY (as opposed to a failed
-# status code). A truncated body is not a rate limit, so it doesn't want
-# the rate-limit-sized pause: with max_attempts = 10, reusing
-# pause_seconds here would hold the client for 135s on a hiccup that
-# usually clears on the first retry.
+
+# Pause before retrying a failed/truncated BODY (not a rate-limit, so a
+# short wait is correct — usually clears on the first retry).
 body_retry_pause_seconds = 2
 
-# --- keeping parallel requests from fighting each other over a rate limit ---
-# Kilo runs several requests at once and each one retries in its own
-# thread, so without these the proxy answers an upstream "slow down" by
-# sending more traffic, not less: 5 requests x 10 attempts inside the same
-# window the upstream asked everyone to sit out.
-#
-# How many requests may be talking to the upstream at once. 0 = unlimited
-# (the old behaviour). Set this to the number of parallel requests the
-# provider actually tolerates — for a single free-tier key that is usually
-# 1 or 2. Extra requests queue instead of piling onto the limit.
+# ── Concurrency / anti-thundering-herd ────────────────────────────────────
+# Max requests talking to the upstream simultaneously.
+# 0 = unlimited (old behaviour).  For a single free-tier key: 1 or 2.
+# Extra requests queue instead of piling onto the limit.
 max_concurrent_upstream = 3
-# Ceiling on how long ONE request may spend retrying before it answers the
-# client. 0 = unlimited (the old behaviour). Keep it under the client's own
-# timeout: retrying for 63s when Kilo gave up at 30s means the answer is
-# written to a socket nobody is reading. Kilo handles a 429 + Retry-After
-# perfectly well, so handing control back early is the better trade.
+
+# Hard ceiling on how long one request may spend retrying before giving up
+# and answering the client.  0 = unlimited.
+# Keep this under the client's own timeout.
 max_total_retry_seconds = 45
-#for ollama 0
-# Random spread applied when queued requests come off a shared cooldown,
-# so they don't all fire on the same instant and re-trigger the limit.
+# For Ollama: 0
+
+# Random jitter applied when queued requests come off a shared cooldown,
+# to avoid all firing at the same instant and re-triggering the limit.
 cooldown_jitter_seconds = 0.5
-# Growth factor for the FALLBACK wait (pause_seconds) across attempts
-# within one request — 15s, 30s, 60s... capped by max_pause_seconds. Only
-# applies when the upstream gave no Retry-After header and no body hint;
-# an explicit number from the upstream is always honoured as given.
-# 1.0 = flat, the old behaviour.
+
+# Exponential backoff factor for the fallback pause across attempts:
+# pause × factor^attempt — e.g. 10s, 20s, 40s … capped at max_pause_seconds.
+# Only applies when the upstream gave no Retry-After / body hint.
+# 1.0 = flat (old behaviour).
 backoff_factor = 2.0

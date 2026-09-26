@@ -107,6 +107,7 @@ port = 8080
 [upstream]
 host = "example.invalid"
 timeout_sec = 5
+{user_agent_line}
 
 [proxy]
 use_socks5 = false
@@ -149,6 +150,7 @@ DEFAULTS = dict(
     max_total_retry_seconds=0,
     cooldown_jitter_seconds=0,
     backoff_factor=2.0,
+    user_agent_line="",
 )
 
 
@@ -637,6 +639,109 @@ class ConcurrencyLimitTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # SOCKS5 startup check
 # ---------------------------------------------------------------------------
+class RecordingUpstream(ScriptedUpstream):
+    """ScriptedUpstream that also keeps every Request it was handed."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.requests = []
+
+    def __call__(self, req, timeout=None):
+        self.requests.append(req)
+        return super().__call__(req, timeout)
+
+
+LIP_UA = "learn-in-play1-llm-client/1.0 (+https://github.com/homdx/learn-in-play1)"
+KILO_UA = "Kilo-Code/7.6.2"
+
+
+def _ua_line(value):
+    return f'user_agent = "{value}"'
+
+
+class UserAgentOverrideTest(unittest.TestCase):
+    """[upstream] user_agent: when set, Kilo's User-Agent is dropped and the
+    configured one is sent; when empty/absent, nothing changes."""
+
+    def _send(self, mod, client_headers, upstream_items=None):
+        upstream = RecordingUpstream(upstream_items or [FakeResp(CLEAN_SSE)])
+        mod.urllib.request.urlopen = upstream
+        h = make_handler(mod)
+        h.headers.update(client_headers)
+        h._proxy("POST")
+        return h, upstream
+
+    def test_configured_user_agent_replaces_the_clients(self):
+        mod = load_proxy(user_agent_line=_ua_line(LIP_UA))
+        h, up = self._send(mod, {"User-Agent": KILO_UA, "X-Keep-Me": "1"})
+
+        self.assertEqual(h._sent_statuses, [200])
+        req = up.requests[0]
+        self.assertEqual(req.get_header("User-agent"), LIP_UA)
+        # Kilo's string is gone from every header, not just User-Agent.
+        for name, value in req.header_items():
+            self.assertNotIn("Kilo", value, f"{name} still carries Kilo's UA")
+        # ...and unrelated client headers are untouched.
+        self.assertEqual(req.get_header("X-keep-me"), "1")
+
+    def test_lowercase_or_duplicate_user_agent_headers_are_all_dropped(self):
+        mod = load_proxy(user_agent_line=_ua_line(LIP_UA))
+        out = mod._build_upstream_headers(
+            [("user-agent", KILO_UA), ("User-Agent", KILO_UA + "-2"), ("X-A", "b")],
+            "example.invalid",
+        )
+        uas = [v for k, v in out.items() if k.lower() == "user-agent"]
+        self.assertEqual(uas, [LIP_UA])
+        self.assertEqual(out["X-A"], "b")
+
+    def test_override_is_sent_even_when_the_client_sent_no_user_agent(self):
+        mod = load_proxy(user_agent_line=_ua_line(LIP_UA))
+        _, up = self._send(mod, {})
+        self.assertEqual(up.requests[0].get_header("User-agent"), LIP_UA)
+
+    def test_off_by_default_clients_user_agent_passes_through(self):
+        mod = load_proxy()  # no user_agent key at all
+        _, up = self._send(mod, {"User-Agent": KILO_UA})
+        self.assertEqual(up.requests[0].get_header("User-agent"), KILO_UA)
+
+    def test_empty_or_blank_value_means_off(self):
+        for line in ('user_agent = ""', 'user_agent = "   "'):
+            with self.subTest(line=line):
+                mod = load_proxy(user_agent_line=line)
+                _, up = self._send(mod, {"User-Agent": KILO_UA})
+                self.assertEqual(up.requests[0].get_header("User-agent"), KILO_UA)
+
+    def test_override_survives_a_silent_retry(self):
+        mod = load_proxy(user_agent_line=_ua_line(LIP_UA))
+        h, up = self._send(
+            mod, {"User-Agent": KILO_UA},
+            [make_http_error(502), FakeResp(CLEAN_SSE)],
+        )
+        self.assertEqual(up.calls, 2)
+        self.assertEqual(h._sent_statuses, [200])
+        for req in up.requests:
+            self.assertEqual(req.get_header("User-agent"), LIP_UA)
+
+    def test_host_and_accept_encoding_are_still_set(self):
+        mod = load_proxy(user_agent_line=_ua_line(LIP_UA))
+        _, up = self._send(mod, {"Host": "127.0.0.1:8080", "Accept-Encoding": "gzip"})
+        req = up.requests[0]
+        self.assertEqual(req.get_header("Host"), "example.invalid")
+        self.assertEqual(req.get_header("Accept-encoding"), "identity")
+
+    def test_bad_values_fail_at_startup_with_a_clear_message(self):
+        cases = {
+            "not a string": "user_agent = 5",
+            "newline": 'user_agent = "a\\nb"',
+            "non-latin-1": 'user_agent = "клиент/1.0"',
+        }
+        for label, line in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(SystemExit) as ctx:
+                    load_proxy(user_agent_line=line)
+                self.assertIn("user_agent", str(ctx.exception))
+
+
 class SocksStartupTest(unittest.TestCase):
     def test_missing_pysocks_fails_clearly_instead_of_a_bare_traceback(self):
         tmpdir = tempfile.mkdtemp(prefix="proxy_socks_test_")
