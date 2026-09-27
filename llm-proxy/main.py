@@ -116,6 +116,182 @@ if any(not k.strip() for k in _RAW_UPSTREAM_API_KEYS):
     raise SystemExit("config.toml [upstream] api_keys must not contain empty strings.")
 UPSTREAM_API_KEYS = _RAW_UPSTREAM_API_KEYS
 
+# --- Gemini "missing thought_signature" 400 workaround --------------------
+# Gemini 3.x models require the `extra_content.google.thought_signature`
+# that came back on a tool_calls[] entry in a PREVIOUS response to be
+# echoed back verbatim on that same tool_calls[] entry when the client
+# resends the conversation history. Several clients (Kilo Code included,
+# see kilocode issues #4639 / #6018) don't round-trip that field, so the
+# very next request 400s with "Function call is missing a
+# thought_signature ...". This proxy sees BOTH directions of every
+# request, so it can do the round-tripping FOR the client instead:
+#   1. On every response that streams by, cache any thought_signature
+#      seen on a tool_call, keyed by (session id, tool_call id).
+#   2. On a 400 from the upstream, before giving up, check whether the
+#      request we just sent had a tool_calls[] entry missing its
+#      thought_signature for which we have a cached value -- if so,
+#      splice it in and try that same attempt again.
+# REACTIVE ONLY (fixes it after the first 400, not before) -- simplest
+# version, opt out via config if it misbehaves.
+FIX_GEMINI_THOUGHT_SIGNATURES = bool(
+    CONFIG["upstream"].get("fix_gemini_thought_signatures", True)
+)
+# session id -> {tool_call_id: thought_signature}. Bounded so a
+# long-running proxy doesn't accumulate one entry per session forever.
+_THOUGHT_SIG_CACHE: dict[str, dict[str, str]] = {}
+_THOUGHT_SIG_LOCK = threading.Lock()
+_THOUGHT_SIG_MAX_SESSIONS = 500
+
+
+def _thought_sig_remember(session_id: str, tool_call_id: str, signature: str) -> None:
+    if not session_id or not tool_call_id or not signature:
+        return
+    with _THOUGHT_SIG_LOCK:
+        bucket = _THOUGHT_SIG_CACHE.setdefault(session_id, {})
+        bucket[tool_call_id] = signature
+        if len(_THOUGHT_SIG_CACHE) > _THOUGHT_SIG_MAX_SESSIONS:
+            # Cheap unbounded-growth guard, not a real LRU: drop whichever
+            # session dict insertion-ordering puts first. Good enough for
+            # "don't grow forever", not trying to be precise about which
+            # session is actually coldest.
+            oldest = next(iter(_THOUGHT_SIG_CACHE))
+            if oldest != session_id:
+                _THOUGHT_SIG_CACHE.pop(oldest, None)
+
+
+def _thought_sig_lookup(session_id: str, tool_call_id: str) -> str | None:
+    if not session_id or not tool_call_id:
+        return None
+    with _THOUGHT_SIG_LOCK:
+        return _THOUGHT_SIG_CACHE.get(session_id, {}).get(tool_call_id)
+
+
+def _google_thought_signature(tool_call: dict) -> str | None:
+    """tool_call["extra_content"]["google"]["thought_signature"], tolerant
+    of every level of that path being absent -- OR present but explicitly
+    JSON null, which some providers/clients send instead of omitting the
+    key. `.get("google", {})` only substitutes {} when the key is MISSING;
+    an explicit `"google": null` sails straight through it and the next
+    `.get` blows up with AttributeError on None. `or {}` treats both the
+    same. Bug found via manual review -- no test in this suite exercises
+    this feature at all, so this crash previously had zero coverage.
+    """
+    extra = tool_call.get("extra_content") or {}
+    google = extra.get("google") or {}
+    return google.get("thought_signature")
+
+
+def _capture_thought_signatures(session_id: str, parsed_body) -> None:
+    """Pull any tool_call thought_signature(s) out of a parsed response
+    body (streamed or not) and remember them for this session.
+
+    Streaming deltas split a tool_call across several chunks: the id
+    usually only appears on the FIRST chunk for a given tool_call index,
+    while extra_content can arrive on a later chunk for that same index.
+    So this tracks id-by-index across the whole `stream_chunks` list
+    before matching signatures to ids, instead of assuming both land in
+    the same chunk.
+    """
+    if not session_id or not isinstance(parsed_body, dict):
+        return
+
+    def _tool_calls_from_container(container):
+        if not isinstance(container, dict):
+            return []
+        tc = container.get("tool_calls")
+        return tc if isinstance(tc, list) else []
+
+    # Non-streaming shape: body.choices[].message.tool_calls[]
+    for choice in parsed_body.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        for tc in _tool_calls_from_container(choice.get("message")):
+            if not isinstance(tc, dict):
+                continue
+            sig = _google_thought_signature(tc)
+            if tc.get("id") and sig:
+                _thought_sig_remember(session_id, tc["id"], sig)
+
+    # Streaming shape: {"stream_chunks": [ {choices:[{delta:{tool_calls:[...]}}]}, "[DONE]", ... ]}
+    chunks = parsed_body.get("stream_chunks")
+    if not isinstance(chunks, list):
+        return
+    index_to_id: dict[int, str] = {}
+    index_to_sig: dict[int, str] = {}
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        for choice in chunk.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            for tc in _tool_calls_from_container(choice.get("delta")):
+                if not isinstance(tc, dict):
+                    continue
+                idx = tc.get("index", 0)
+                if tc.get("id"):
+                    index_to_id[idx] = tc["id"]
+                sig = _google_thought_signature(tc)
+                if sig:
+                    index_to_sig[idx] = sig
+    for idx, sig in index_to_sig.items():
+        tool_call_id = index_to_id.get(idx)
+        if tool_call_id:
+            _thought_sig_remember(session_id, tool_call_id, sig)
+
+
+def _safe_capture_thought_signatures(session_id: str, parsed_body) -> None:
+    """Wraps _capture_thought_signatures so it can never break the
+    response relay/logging it's called from. This is a best-effort side
+    channel for an opt-out-able workaround (see FIX_GEMINI_THOUGHT_SIGNATURES
+    above) -- an upstream shape this wasn't written for should be logged
+    and ignored, not allowed to take the response with it.
+    """
+    try:
+        _capture_thought_signatures(session_id, parsed_body)
+    except Exception as e:
+        print(f".. thought-signature capture failed, ignoring ({type(e).__name__}: {e})", flush=True)
+
+
+def _try_fix_missing_thought_signature(session_id: str, body: bytes) -> bytes | None:
+    """If `body` has a tool_calls[] entry missing thought_signature for
+    which we have a cached value, return a fixed copy of the body.
+    Returns None if nothing could be fixed (no session id, not JSON, not
+    a JSON object, no cached signature for any missing one, or nothing
+    was missing).
+    """
+    if not session_id or not body:
+        return None
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None  # e.g. a top-level JSON array -- nothing to walk
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return None
+
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            continue
+        for tc in tool_calls:
+            if not isinstance(tc, dict) or not tc.get("id"):
+                continue
+            if _google_thought_signature(tc):
+                continue  # already has one, nothing to fix
+            sig = _thought_sig_lookup(session_id, tc["id"])
+            if sig:
+                tc["extra_content"] = {"google": {"thought_signature": sig}}
+                changed = True
+
+    if not changed:
+        return None
+    return json.dumps(payload).encode()
+
 # --- transparent per-key upstream routing via the api_manager sqlite store ---
 # Optional [keys] section in config.toml; .get(...) so an existing
 # config.toml without it still works and this is a no-op. When the
@@ -1181,6 +1357,43 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 err_body = e.read()
                 headers = list(e.headers.items()) if e.headers else []
 
+                if (FIX_GEMINI_THOUGHT_SIGNATURES and e.code == 400
+                        and attempt < max_attempts):
+                    # Best-effort: on any unexpected shape this raises,
+                    # treat it the same as "nothing to fix" rather than
+                    # losing the request/response entirely -- a crash here
+                    # would propagate out of this except block with no
+                    # response ever sent to the client at all.
+                    try:
+                        fixed_body = _try_fix_missing_thought_signature(
+                            self.headers.get("x-session-id"), body)
+                    except Exception as fix_exc:
+                        print(
+                            f".. [{req_id}] thought_signature backfill failed, "
+                            f"ignoring ({type(fix_exc).__name__}: {fix_exc})",
+                            flush=True,
+                        )
+                        fixed_body = None
+                    if fixed_body is not None:
+                        print(
+                            f".. [{req_id}] upstream 400 \u2014 found a cached "
+                            f"thought_signature for a tool_call this request "
+                            f"was missing it on, retrying with it filled in "
+                            f"(not sent to Kilo)",
+                            flush=True,
+                        )
+                        write_log({
+                            "type": "response",
+                            "id": req_id,
+                            "status": 400,
+                            "attempt": attempt,
+                            "retrying": True,
+                            "action": "thought_signature_backfilled",
+                            "body": _parse_body(err_body, _get_ci(headers, "Content-Type")),
+                        })
+                        body = fixed_body
+                        continue
+
                 if multi_key and 400 <= e.code < 600:
                     # Key rotation: a distinct mechanism from the retry-
                     # with-backoff path below. No pause, no shared cooldown,
@@ -1579,6 +1792,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             raise _ClientGone from None
 
         parsed_body = _parse_body(bytes(captured), content_type)
+        if FIX_GEMINI_THOUGHT_SIGNATURES:
+            _safe_capture_thought_signatures(self.headers.get("x-session-id"), parsed_body)
         write_log({
             "type": "response",
             "id": req_id,
@@ -1661,6 +1876,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             raise _ClientGone from None
 
         parsed_body = _parse_body(raw[:LOG_BODY_LIMIT], content_type)
+        if FIX_GEMINI_THOUGHT_SIGNATURES:
+            _safe_capture_thought_signatures(self.headers.get("x-session-id"), parsed_body)
         write_log({
             "type": "response",
             "id": req_id,
