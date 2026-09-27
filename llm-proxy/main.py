@@ -127,12 +127,19 @@ UPSTREAM_API_KEYS = _RAW_UPSTREAM_API_KEYS
 # request, so it can do the round-tripping FOR the client instead:
 #   1. On every response that streams by, cache any thought_signature
 #      seen on a tool_call, keyed by (session id, tool_call id).
-#   2. On a 400 from the upstream, before giving up, check whether the
-#      request we just sent had a tool_calls[] entry missing its
-#      thought_signature for which we have a cached value -- if so,
-#      splice it in and try that same attempt again.
-# REACTIVE ONLY (fixes it after the first 400, not before) -- simplest
-# version, opt out via config if it misbehaves.
+#   2. PROACTIVELY, before the request's first attempt even goes out:
+#      check whether the body has a tool_calls[] entry missing its
+#      thought_signature for which we have a cached value already (the
+#      common case — the value was cached from the previous turn in this
+#      same session) -- if so, splice it in before ever touching the
+#      network. This is what avoids the wasted round trip / doubled
+#      upstream-quota spend that the purely-reactive version below cost
+#      on every single occurrence.
+#   3. REACTIVELY, as a fallback: on a 400 from the upstream, before
+#      giving up, check again (covers a signature that only became known
+#      — e.g. from a concurrent request on the same session — after step
+#      2 already ran) -- if so, splice it in and retry that same attempt.
+# Opt out via config if it misbehaves.
 FIX_GEMINI_THOUGHT_SIGNATURES = bool(
     CONFIG["upstream"].get("fix_gemini_thought_signatures", True)
 )
@@ -1192,6 +1199,34 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self._heartbeat_active = False
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b""
+
+        if FIX_GEMINI_THOUGHT_SIGNATURES:
+            # Proactive half of the workaround (see the comment above
+            # FIX_GEMINI_THOUGHT_SIGNATURES): fill in a cached
+            # thought_signature BEFORE the first attempt whenever we
+            # already have one, instead of only after the upstream 400s.
+            # Same function the reactive fallback below uses; same
+            # try/except shape, for the same reason -- an unexpected
+            # request shape here must never cost the request itself.
+            try:
+                proactive_body = _try_fix_missing_thought_signature(
+                    self.headers.get("x-session-id"), body)
+            except Exception as fix_exc:
+                print(
+                    f".. [{req_id}] proactive thought_signature backfill failed, "
+                    f"ignoring ({type(fix_exc).__name__}: {fix_exc})",
+                    flush=True,
+                )
+                proactive_body = None
+            if proactive_body is not None:
+                print(
+                    f".. [{req_id}] found a cached thought_signature for a "
+                    f"tool_call this request was missing it on \u2014 filling "
+                    f"it in before the first attempt (was going to cost a "
+                    f"wasted upstream call otherwise)",
+                    flush=True,
+                )
+                body = proactive_body
 
         write_log({
             "type": "request",

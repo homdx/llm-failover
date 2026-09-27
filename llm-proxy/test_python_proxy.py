@@ -64,6 +64,7 @@ import contextlib
 import email.message
 import importlib.util
 import io
+import json
 import os
 import shutil
 import sys
@@ -108,6 +109,7 @@ port = 8080
 host = "example.invalid"
 timeout_sec = 5
 {user_agent_line}
+{thought_sig_line}
 
 [proxy]
 use_socks5 = false
@@ -151,6 +153,7 @@ DEFAULTS = dict(
     cooldown_jitter_seconds=0,
     backoff_factor=2.0,
     user_agent_line="",
+    thought_sig_line="",
 )
 
 
@@ -818,6 +821,145 @@ class RealConfigSanityTest(unittest.TestCase):
             self.assertGreaterEqual(retry["max_attempts"], 1)
         if retry.get("max_concurrent_upstream") is not None:
             self.assertGreaterEqual(retry["max_concurrent_upstream"], 0)
+
+
+def _tool_call_body(session_id_unused=None, tool_call_id="call_1", include_signature=False):
+    """A minimal chat-completion request body with one echoed tool_calls[]
+    entry, optionally already carrying its thought_signature."""
+    tc = {"id": tool_call_id, "type": "function",
+          "function": {"name": "read_file", "arguments": "{}"}}
+    if include_signature:
+        tc["extra_content"] = {"google": {"thought_signature": "sig-abc"}}
+    body = {
+        "model": "gemini-3-flash",
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "tool_calls": [tc]},
+        ],
+    }
+    return json.dumps(body).encode()
+
+
+class ThoughtSignatureFixFunctionTest(unittest.TestCase):
+    """Pure unit tests for _try_fix_missing_thought_signature -- previously
+    had zero test coverage at all."""
+
+    def setUp(self):
+        self.mod = load_proxy()
+
+    def test_no_session_id_returns_none(self):
+        body = _tool_call_body()
+        self.assertIsNone(self.mod._try_fix_missing_thought_signature(None, body))
+        self.assertIsNone(self.mod._try_fix_missing_thought_signature("", body))
+
+    def test_no_cached_signature_returns_none(self):
+        body = _tool_call_body(tool_call_id="call_1")
+        # Nothing was ever remembered for this session/tool_call.
+        self.assertIsNone(self.mod._try_fix_missing_thought_signature("sess-1", body))
+
+    def test_cached_signature_is_spliced_in(self):
+        self.mod._thought_sig_remember("sess-1", "call_1", "cached-sig")
+        body = _tool_call_body(tool_call_id="call_1", include_signature=False)
+        fixed = self.mod._try_fix_missing_thought_signature("sess-1", body)
+        self.assertIsNotNone(fixed)
+        payload = json.loads(fixed)
+        tc = payload["messages"][1]["tool_calls"][0]
+        self.assertEqual(tc["extra_content"]["google"]["thought_signature"], "cached-sig")
+
+    def test_tool_call_that_already_has_a_signature_is_left_alone(self):
+        self.mod._thought_sig_remember("sess-1", "call_1", "cached-sig")
+        body = _tool_call_body(tool_call_id="call_1", include_signature=True)
+        # Already has one (a different value even) -- nothing to fix, so no
+        # change is reported, and the existing value must not be clobbered.
+        self.assertIsNone(self.mod._try_fix_missing_thought_signature("sess-1", body))
+
+    def test_malformed_json_returns_none_not_an_exception(self):
+        self.assertIsNone(
+            self.mod._try_fix_missing_thought_signature("sess-1", b"not json at all"))
+
+    def test_body_without_messages_returns_none(self):
+        self.mod._thought_sig_remember("sess-1", "call_1", "cached-sig")
+        body = json.dumps({"model": "x"}).encode()
+        self.assertIsNone(self.mod._try_fix_missing_thought_signature("sess-1", body))
+
+
+class ThoughtSignatureProactiveTest(unittest.TestCase):
+    """_proxy applying the fix BEFORE the first attempt -- this is the fix
+    for the doubled-upstream-call bug: previously every occurrence of this
+    Gemini quirk cost a wasted real request (send broken -> 400 -> resend
+    fixed), even though the signature was already known ahead of time."""
+
+    def _send(self, mod, upstream_items, session_id="sess-1", body=None):
+        upstream = RecordingUpstream(upstream_items)
+        mod.urllib.request.urlopen = upstream
+        h = make_handler(mod, body=body or _tool_call_body(tool_call_id="call_1"))
+        h.headers["x-session-id"] = session_id
+        h._proxy("POST")
+        return h, upstream
+
+    def test_warm_cache_fixes_the_body_before_the_first_call_ever_goes_out(self):
+        mod = load_proxy()
+        mod._thought_sig_remember("sess-1", "call_1", "cached-sig")
+        h, up = self._send(mod, [FakeResp(CLEAN_SSE)])
+
+        self.assertEqual(up.calls, 1, "must not cost a second real upstream call")
+        self.assertEqual(h._sent_statuses, [200])
+        sent_body = json.loads(up.requests[0].data)
+        tc = sent_body["messages"][1]["tool_calls"][0]
+        self.assertEqual(tc["extra_content"]["google"]["thought_signature"], "cached-sig")
+
+    def test_cold_cache_sends_the_body_unmodified(self):
+        mod = load_proxy()
+        # Nothing cached for this session -- proactive check has nothing to
+        # fix, so the original body goes out untouched.
+        h, up = self._send(mod, [FakeResp(CLEAN_SSE)])
+
+        self.assertEqual(up.calls, 1)
+        sent_body = json.loads(up.requests[0].data)
+        tc = sent_body["messages"][1]["tool_calls"][0]
+        self.assertNotIn("extra_content", tc)
+
+    def test_disabled_never_touches_the_body_even_with_a_warm_cache(self):
+        mod = load_proxy(thought_sig_line="fix_gemini_thought_signatures = false")
+        mod._thought_sig_remember("sess-1", "call_1", "cached-sig")
+        h, up = self._send(mod, [FakeResp(CLEAN_SSE)])
+
+        sent_body = json.loads(up.requests[0].data)
+        tc = sent_body["messages"][1]["tool_calls"][0]
+        self.assertNotIn("extra_content", tc, "the workaround must be fully off")
+
+    def test_a_garbage_body_does_not_crash_the_request(self):
+        mod = load_proxy()
+        mod._thought_sig_remember("sess-1", "call_1", "cached-sig")
+        h, up = self._send(mod, [FakeResp(CLEAN_SSE)], body=b"not json at all")
+
+        self.assertEqual(h._sent_statuses, [200])
+        self.assertEqual(up.requests[0].data, b"not json at all")
+
+    def test_reactive_fallback_still_covers_a_signature_that_only_becomes_known_mid_flight(self):
+        # The cache is cold when the FIRST attempt is built (proactive finds
+        # nothing), but becomes warm at the moment that attempt reaches the
+        # (fake) upstream -- e.g. a concurrent request on the same session
+        # just captured it. The reactive check inside the HTTPError handler
+        # must still catch this and fix the retry.
+        mod = load_proxy()
+
+        def first_call_learns_the_signature_then_400s():
+            mod._thought_sig_remember("sess-1", "call_1", "learned-late-sig")
+            raise make_http_error(
+                400, body=b'{"error":"Function call is missing a thought_signature"}')
+
+        h, up = self._send(mod, [first_call_learns_the_signature_then_400s, FakeResp(CLEAN_SSE)])
+
+        self.assertEqual(up.calls, 2, "cold cache genuinely needs the extra round trip once")
+        self.assertEqual(h._sent_statuses, [200])
+        first_sent = json.loads(up.requests[0].data)
+        self.assertNotIn("extra_content", first_sent["messages"][1]["tool_calls"][0])
+        second_sent = json.loads(up.requests[1].data)
+        self.assertEqual(
+            second_sent["messages"][1]["tool_calls"][0]["extra_content"]["google"]["thought_signature"],
+            "learned-late-sig",
+        )
 
 
 if __name__ == "__main__":

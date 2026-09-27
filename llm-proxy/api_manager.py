@@ -361,13 +361,14 @@ class ApiStore:
 def render_table(entries: Sequence[ApiEntry]) -> str:
     if not entries:
         return "(no entries)"
-    # FAILOVER KEYS shows just the pool size here to keep the table
-    # readable; `get NAME --show-keys` or `keys list NAME` gives the
-    # actual values.
+    # FAILOVER KEYS shows the actual values (masked unless the caller
+    # passed already-unmasked entries, e.g. via `list --show-keys`) --
+    # NOT just a count. A count here was the bug: `--show-keys` promises
+    # to reveal keys in plain text, and a bare "2" reveals nothing.
     headers = ["NAME", "HOST", "BASE URL", "API KEY", "FAILOVER KEYS", "NOTE"]
     rows = [
         [e.name, e.host, e.base_url, e.api_key,
-         str(len(e.failover_keys)) if e.failover_keys else "-", e.note or "-"]
+         ", ".join(e.failover_keys) if e.failover_keys else "-", e.note or "-"]
         for e in entries
     ]
     widths = [
